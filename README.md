@@ -5,7 +5,7 @@ An end-to-end **subtitle generation pipeline** for anime and similar video conte
 This tool:
 - Extracts audio from an MP4 file
 - Automatically segments speech using **WebRTC VAD with hysteresis**
-- Performs **Chinese ASR** using **WeNet** (CLI or daemon mode)
+- Performs **Chinese ASR** using **WeNet** (with daemon mode)
 - Translates Chinese subtitles to Japanese using **NLLB-200**
 - Outputs **SRT subtitle files**:
   - Chinese + Japanese
@@ -28,9 +28,7 @@ This tool:
 
 ### 🧠 Speech Recognition (ASR)
 - Powered by **WeNet**
-- Two execution modes:
-  - **Daemon mode (recommended)** for high performance
-  - Direct CLI execution
+- WeNet run **Daemon mode** for high performance
 - Parallel ASR with configurable worker count
 - Persistent **SQLite ASR cache** keyed by audio content (SHA1)
 
@@ -102,7 +100,7 @@ The daemon provides:
 ### Basic Command
 
 ```bash
-python3 anime_srt.py input.mp4
+python3 anime_srt_generator_zh2ja.py input.mp4
 ```
 
 ### This generates:
@@ -113,7 +111,7 @@ python3 anime_srt.py input.mp4
 ### Specify Output File
 
 ``` bash
-python3 anime_srt.py input.mp4 output.srt
+python3 anime_srt_generator_zh2ja.py input.mp4 output.srt
 ```
 
 ### Common Options
@@ -129,7 +127,7 @@ python3 anime_srt.py input.mp4 output.srt
 ### Example:
 
 ``` bash
-python3 anime_srt.py episode01.mp4 \
+python3 anime_srt_generator_zh2ja.py episode01.mp4 \
   --workers 8 \
   --batch 32 \
   --num-threads 8
@@ -199,7 +197,6 @@ DEFAULT_NLLB_MODEL = "facebook/nllb-200-3.3B"
 USE_TRANS_CACHE = 1
 USE_ASR_CACHE = 1
 
-USE_ASR_DAEMON = 1
 USE_RAMDISK = 1
 ```
 

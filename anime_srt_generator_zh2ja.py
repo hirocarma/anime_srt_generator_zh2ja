@@ -18,7 +18,6 @@ from threading import Lock
 import hashlib
 import threading
 import datetime
-import wenet
 import json
 import urllib.request
 from functools import lru_cache
@@ -37,12 +36,10 @@ DEFAULT_NLLB_MODEL = "facebook/nllb-200-3.3B"
 TRANS_TMPDIR = str(Path.home() / "tmp" / "anime_trans_tmp")
 CACHE_TRANS_DB_PATH = TRANS_TMPDIR + "/" + "translation_cache.db"
 CACHE_WENET_DB_PATH = TRANS_TMPDIR + "/" + "wenet_cache.db"
-ANIME_WORDS_PATH = str(Path.home() / "etc" / "anime_words.txt")
 
 USE_TRANS_CACHE = 1
 USE_ASR_CACHE = 1
 
-USE_ASR_DAEMON = 1
 WENET_DAEMON_HOST = "127.0.0.1"
 WENET_DAEMON_PORT = 9000
 WENET_DAEMON_SCRIPT = os.path.dirname(__file__) + "/" + "wenet_daemon.py"
@@ -103,20 +100,6 @@ print("[Init] NLLB translator ready.")
 
 # Load OpenCC(global)
 CC_T2S = OpenCC("t2s")
-
-
-# -----------------------
-# Global WeNet Setup (Run Once)
-# -----------------------
-if not USE_ASR_DAEMON:
-    print(f"[Init] Loading WeNet model ({WENET_MODEL}) into memory...")
-    try:
-        _wenet_model_instance = wenet.load_model(WENET_MODEL)
-        print("[Init] WeNet model loaded successfully.")
-
-    except Exception as e:
-        print(f"[Error] Failed to load WeNet model: {e}")
-        sys.exit(1)
 
 
 # --------------------------------------------------
@@ -862,64 +845,6 @@ def wenet_daemon_transcribe_cached(path_str: str) -> str:
 def run_wenet_asr_with_cache_daemon(seg_path: Path) -> str:
     return wenet_daemon_transcribe_cached(str(seg_path.resolve()))
 
-
-# ------------------------------------------------------------------
-# WeNet wrapper (CLI usage)
-# ------------------------------------------------------------------
-def run_wenet_on_segment(seg_path: Path, wenet_model_name: str, timeout: int = 600):
-    cmd = [
-        "wenet",
-        "-m",
-        wenet_model_name,
-        "--beam",
-        "40",
-        "--device",
-        "cpu",
-        "--context_path",
-        ANIME_WORDS_PATH,
-        "--context_score",
-        "3.0",
-        "--punc",
-        "-pm",
-        "./wenet_punc_model",
-        str(seg_path),
-    ]
-    try:
-        p = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-        )
-        raw_lines = p.stdout.splitlines()
-        candidates = []
-        for ln in raw_lines:
-            if not ln.strip():
-                continue
-            low = ln.strip()
-            if "torch_npu" in low or "Ascend NPU" in low:
-                continue
-            if "Module" in low and "not found" in low:
-                continue
-            if (
-                low.startswith("File:")
-                or low.lower().startswith("processing")
-                or low.startswith("Read")
-            ):
-                continue
-            candidates.append(low)
-
-        if not candidates:
-            return ""
-        # return the top (first) candidate from WeNet CLI output
-        return candidates[0]
-
-    except Exception as e:
-        print(f"  [ERROR] WeNet failed on {seg_path}: {e}")
-        return ""
-
-
 # instantiate ASR cache (file in cwd by default)
 asr_cache = ASRCache()
 
@@ -929,10 +854,7 @@ def run_wenet_asr_with_cache(wav_path: str):
     if cached is not None:
         return cached
 
-    if USE_ASR_DAEMON:
-        text = run_wenet_asr_with_cache_daemon(wav_path)
-    else:
-        text = run_wenet_on_segment(wav_path)
+    text = run_wenet_asr_with_cache_daemon(wav_path)
 
     asr_cache.set(wav_path, text)
 
@@ -1011,10 +933,9 @@ def setup_wenet_environment():
     else:
         wenet_model_name = WENET_MODEL
 
-    if USE_ASR_DAEMON:
-        if not ensure_wenet_daemon_running(wenet_model_name):
-            raise RuntimeError("WeNet daemon could not be started")
-        print("[INFO] Using WeNet daemon...")
+    if not ensure_wenet_daemon_running(wenet_model_name):
+        raise RuntimeError("WeNet daemon could not be started")
+    print("[INFO] Using WeNet daemon...")
 
     return wenet_model_name
 
@@ -1033,10 +954,7 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
             if USE_ASR_CACHE:
                 fut = ex.submit(run_wenet_asr_with_cache, seg_path)
             else:
-                if USE_ASR_DAEMON:
-                    fut = ex.submit(wenet_daemon_transcribe, seg_path)
-                else:
-                    fut = ex.submit(run_wenet_on_segment, seg_path, wenet_model_name)
+                fut = ex.submit(wenet_daemon_transcribe, seg_path)
 
             futures[fut] = (i, st, ed)
 

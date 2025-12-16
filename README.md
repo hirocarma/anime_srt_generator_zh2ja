@@ -83,7 +83,7 @@ Follow the official instructions:
 
 Make sure the `wenet` CLI is available in your `$PATH`.
 
-### Optional: WeNet Daemon (Recommended)
+### WeNet Daemon
 
 The pipeline can automatically start a daemon defined in:
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import os
 import argparse
 import json
 import shutil
@@ -25,6 +26,12 @@ class ServerConfig:
     port: int = 9000
     request_timeout: int = 300
 
+    def validate(self):
+        if not (0 < self.port < 65536):
+            raise ValueError(f"invalid port: {self.port}")
+        if self.request_timeout < 0:
+            raise ValueError("request_timeout must be >= 0")
+
 
 @dataclass
 class ASRConfig:
@@ -35,6 +42,28 @@ class ASRConfig:
     beam: int = 40
     context_path: str = str(Path.home() / "etc" / "anime_words.txt")
     min_dur: float = 1.0
+
+    def validate(self):
+        if shutil.which(self.wenet_cmd) is None:
+            raise ValueError(f"{self.wenet_cmd} not found in PATH")
+
+        if self.workers < 1:
+            raise ValueError("ASRConfig.workers must be >= 1")
+
+        if not self.model:
+            raise ValueError("ASRConfig.model must not be empty")
+
+        if self.device not in ("cpu", "cuda", "npu"):
+            raise ValueError(f"invalid device: {self.device}")
+
+        if self.beam < 1:
+            raise ValueError("ASRConfig.beam must be >= 1")
+
+        if not os.path.isfile(self.context_path):
+            raise ValueError(f"ASRConfig.context_path {self.context_path} not found")
+
+        if self.min_dur < 0:
+            raise ValueError("ASRConfig.min_dur must be >= 0")
 
 
 @dataclass
@@ -57,6 +86,12 @@ class AppConfig:
                 beam=args.beam or ASRConfig.beam,
             ),
         )
+
+    def validate(self):
+        self.server.validate()
+        self.asr.validate()
+
+
 # ----------------------------
 
 
@@ -289,11 +324,7 @@ def main():
 
     args = ap.parse_args()
     config = AppConfig.from_args(args)
-
-    # Check presence of wenet in PATH
-    if shutil.which(config.asr.wenet_cmd) is None:
-        safe_print("ERROR: 'wenet' not found in PATH.")
-        return
+    config.validate()
 
     backend = WenetBackend(config.asr)
     pool = WenetWorkerPool(config.asr, backend)

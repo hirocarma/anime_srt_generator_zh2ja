@@ -17,14 +17,48 @@ from dataclasses import dataclass
 from argparse import Namespace
 from typing import Optional
 
-# ---------- Config ----------
-DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 9000
-WENET_CMD = "wenet"
 
-REQUEST_TIMEOUT = 300
-ANIME_WORDS_PATH = str(Path.home() / "etc" / "anime_words.txt")
+# ---------- Config ----------
+@dataclass
+class ServerConfig:
+    host: str = "127.0.0.1"
+    port: int = 9000
+    request_timeout: int = 300
+
+
+@dataclass
+class ASRConfig:
+    wenet_cmd: str = "wenet"
+    workers: int = 2
+    model: str = "wenetspeech"
+    device: str = "cpu"
+    beam: int = 40
+    context_path: str = str(Path.home() / "etc" / "anime_words.txt")
+    min_dur: float = 1.0
+
+
+@dataclass
+class AppConfig:
+    server: ServerConfig
+    asr: ASRConfig
+
+    @classmethod
+    def from_args(cls, args):
+        return cls(
+            server=ServerConfig(
+                host=args.host or ServerConfig.host,
+                port=args.port or ServerConfig.port,
+            ),
+            asr=ASRConfig(
+                workers=args.workers or ASRConfig.workers,
+                model=args.model or ASRConfig.model,
+                device=args.device or ASRConfig.device,
+                context_path=args.context_path or ASRConfig.context_path,
+                beam=args.beam or ASRConfig.beam,
+            ),
+        )
 # ----------------------------
+
 
 _lock_print = threading.Lock()
 
@@ -42,25 +76,6 @@ def get_wav_duration(wav_path: str) -> float:
             return frames / float(rate)
     except Exception:
         return 0.0
-
-
-@dataclass
-class ASRConfig:
-    workers: int = 2
-    model: str = "wenetspeech"
-    device: str = "cpu"
-    beam: int = 40
-    min_dur: float = 1.0
-    request_timeout: int = 300
-
-    @classmethod
-    def from_args(cls, args: Namespace) -> "ASRConfig":
-        return cls(
-            workers=args.workers if args.workers is not None else cls.workers,
-            model=args.model if args.model is not None else cls.model,
-            device=args.device if args.device is not None else cls.device,
-            beam=args.beam if args.beam is not None else cls.beam,
-        )
 
 
 @dataclass
@@ -88,7 +103,7 @@ class WenetBackend(ASRBackend):
             return ASRResult(0, "", f"too short ({dur:.3f}s)")
 
         cmd = [
-            WENET_CMD,
+            self.config.wenet_cmd,
             "-m",
             self.config.model,
             "--device",
@@ -96,7 +111,7 @@ class WenetBackend(ASRBackend):
             "--beam",
             str(self.config.beam),
             "--context_path",
-            ANIME_WORDS_PATH,
+            self.config.context_path,
             "--context_score",
             "3.0",
             "--punc",
@@ -156,7 +171,6 @@ class WenetWorkerPool:
         self.config = config
         self.backend = backend
 
-        # self.workers = self.config.workers
         self._executor = ThreadPoolExecutor(max_workers=self.config.workers)
 
     def submit(self, wav_path: str, timeout: Optional[int] = None):
@@ -189,6 +203,7 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        cfg = self.server.config
         parsed = urlparse(self.path)
         if parsed.path != "/transcribe":
             self._send_json({"ok": False, "error": "unknown endpoint"}, status=404)
@@ -221,7 +236,7 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
             return
 
         # optional params
-        timeout = int(j.get("timeout", REQUEST_TIMEOUT))
+        timeout = int(j.get("timeout", cfg.request_timeout))
 
         # submit job
         fut = self.server.pool.submit(str(wav_p), timeout=timeout)
@@ -249,47 +264,45 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
 
 # ---------- Server runner ----------
 class WenetHTTPServer(HTTPServer):
-    def __init__(self, server_address, RequestHandlerClass, pool: WenetWorkerPool):
+    def __init__(
+        self,
+        config: ServerConfig,
+        RequestHandlerClass,
+        pool: WenetWorkerPool,
+    ):
+        server_address = (config.host, config.port)
         super().__init__(server_address, RequestHandlerClass)
+        self.config = config
         self.pool = pool
 
 
 def main():
 
     ap = argparse.ArgumentParser(description="WeNet CLI daemon")
-    ap.add_argument(
-        "--host", default=DEFAULT_HOST, help="listen host (default 127.0.0.1)"
-    )
-    ap.add_argument(
-        "--port", type=int, default=DEFAULT_PORT, help="listen port (default 9000)"
-    )
-    ap.add_argument(
-        "--workers",
-        type=int,
-        help="concurrent workers (default 2)",
-    )
+    ap.add_argument("--host", help="listen host")
+    ap.add_argument("--port", type=int, help="listen port")
+    ap.add_argument("--workers", type=int, help="concurrent workers")
     ap.add_argument("--model", help="WeNet model name or local dir")
     ap.add_argument("--device", help="WeNet device: cpu/npu/cuda")
     ap.add_argument("--beam", type=int, help="WeNet beam size")
+    ap.add_argument("--context_path", help="WeNet context_path")
 
     args = ap.parse_args()
+    config = AppConfig.from_args(args)
 
     # Check presence of wenet in PATH
-    if shutil.which(WENET_CMD) is None:
-        safe_print("ERROR: 'wenet' not found in PATH. Please install or add to PATH.")
+    if shutil.which(config.asr.wenet_cmd) is None:
+        safe_print("ERROR: 'wenet' not found in PATH.")
         return
 
-    args = ap.parse_args()
-    config = ASRConfig.from_args(args)
+    backend = WenetBackend(config.asr)
+    pool = WenetWorkerPool(config.asr, backend)
 
-    backend = WenetBackend(config)
-    pool = WenetWorkerPool(config, backend)
-
-    server = WenetHTTPServer((args.host, args.port), WenetHTTPRequestHandler, pool)
+    server = WenetHTTPServer(config.server, WenetHTTPRequestHandler, pool)
 
     safe_print(
-        f"[server] Listening on http://{args.host}:{args.port}"
-        + f" workers={config.workers} model={config.model}"
+        f"[server] Listening on http://{config.server.host}:{config.server.port}"
+        + f" workers={config.asr.workers} model={config.asr.model}"
     )
 
     try:

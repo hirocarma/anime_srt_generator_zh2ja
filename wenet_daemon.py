@@ -24,13 +24,12 @@ WENET_CMD = "wenet"
 WENET_MODEL = "wenetspeech"
 WENET_DEVICE = "cpu"  # cpu,npu,cuda
 WENET_BEAM = 40
-WARMUP_SECONDS = 0.6
+
 WARMUP_AUDIO = "wenet_warmup.wav"
 WARMUP_TIMEOUT = 60
+
 REQUEST_TIMEOUT = 300
 ANIME_WORDS_PATH = str(Path.home() / "etc" / "anime_words.txt")
-MIN_DUR = 1.0
-
 # ----------------------------
 
 _lock_print = threading.Lock()
@@ -52,6 +51,17 @@ def get_wav_duration(wav_path: str) -> float:
 
 
 @dataclass
+class ASRConfig:
+    workers: int
+    model: str
+    device: str
+    beam: int
+    min_dur: float = 1.0
+    request_timeout: int = 300
+    warmup_seconds: float = 0.6
+
+
+@dataclass
 class ASRResult:
     rc: int
     text: str
@@ -64,27 +74,25 @@ class ASRBackend:
 
 
 class WenetBackend(ASRBackend):
-    def __init__(self, model: str, device: str, beam: int):
-        self.model = model
-        self.device = device
-        self.beam = beam
+    def __init__(self, config: ASRConfig):
+        self.config = config
 
     def transcribe(self, wav_path: Path, timeout: int) -> ASRResult:
         if not wav_path.exists():
             return ASRResult(127, "", f"file not found: {wav_path}")
 
         dur = get_wav_duration(str(wav_path))
-        if dur < MIN_DUR:
+        if dur < self.config.min_dur:
             return ASRResult(0, "", f"too short ({dur:.3f}s)")
 
         cmd = [
             WENET_CMD,
             "-m",
-            self.model,
+            self.config.model,
             "--device",
-            self.device,
+            self.config.device,
             "--beam",
-            str(self.beam),
+            str(self.config.beam),
             "--context_path",
             ANIME_WORDS_PATH,
             "--context_score",
@@ -138,37 +146,17 @@ class WenetBackend(ASRBackend):
 
 
 class WenetWorkerPool:
-    """
-    Manages a ThreadPoolExecutor that runs `wenet` CLI jobs.
-    Provides optional warmup for each worker to reduce cold-start penalty.
-    """
-
     def __init__(
         self,
-        workers: int,
+        config: ASRConfig,
         backend: ASRBackend,
-        warmup_seconds: float = WARMUP_SECONDS,
     ):
-        self.workers = max(1, int(workers))
+        self.config = config
         self.backend = backend
-        self._executor = ThreadPoolExecutor(max_workers=self.workers)
-        self._warmup_seconds = warmup_seconds
-        self._warmup_done = False
-        self._warmup_lock = threading.Lock()
-        safe_print(f"[debug] WenetWorkerPool model = {self.model}")
 
-
-class WenetWorkerPool:
-    def __init__(
-        self,
-        workers: int,
-        backend: ASRBackend,
-        warmup_seconds: float = WARMUP_SECONDS,
-    ):
-        self.workers = max(1, int(workers))
-        self.backend = backend
+        self.workers = max(1, int(config.workers))
         self._executor = ThreadPoolExecutor(max_workers=self.workers)
-        self._warmup_seconds = warmup_seconds
+
         self._warmup_done = False
         self._warmup_lock = threading.Lock()
 
@@ -176,16 +164,22 @@ class WenetWorkerPool:
         with self._warmup_lock:
             if self._warmup_done:
                 return
+
             safe_print("[warmup] running backend warmup")
 
             tmp = Path.cwd() / WARMUP_AUDIO
-            self._create_silence_wav(tmp, self._warmup_seconds)
+            self._create_silence_wav(tmp, self.config.warmup_seconds)
 
             futures = []
             for _ in range(self.workers):
                 futures.append(
-                    self._executor.submit(self.backend.transcribe, tmp, WARMUP_TIMEOUT)
+                    self._executor.submit(
+                        self.backend.transcribe,
+                        tmp,
+                        WARMUP_TIMEOUT,
+                    )
                 )
+
             for f in futures:
                 try:
                     r = f.result(timeout=WARMUP_TIMEOUT + 5)
@@ -203,11 +197,15 @@ class WenetWorkerPool:
             self._warmup_done = True
 
     def submit(self, wav_path: str, timeout: Optional[int] = None):
-        t = timeout if timeout is not None else REQUEST_TIMEOUT
+        t = timeout if timeout is not None else self.config.request_timeout
 
         def job():
             r = self.backend.transcribe(Path(wav_path), t)
-            return {"rc": r.rc, "text": r.text, "stderr": r.stderr}
+            return {
+                "rc": r.rc,
+                "text": r.text,
+                "stderr": r.stderr,
+            }
 
         return self._executor.submit(job)
 
@@ -217,13 +215,14 @@ class WenetWorkerPool:
         """
         if out_path.exists():
             return
+
         cmd = [
             "ffmpeg",
             "-y",
             "-f",
             "lavfi",
             "-i",
-            f"anullsrc=channel_layout=mono:sample_rate=16000",
+            "anullsrc=channel_layout=mono:sample_rate=16000",
             "-t",
             f"{seconds:.3f}",
             "-ac",
@@ -234,9 +233,13 @@ class WenetWorkerPool:
             "pcm_s16le",
             str(out_path),
         ]
+
         try:
             subprocess.run(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
             )
             safe_print(f"[warmup] created {out_path}")
         except Exception as e:
@@ -355,16 +358,16 @@ def main():
         safe_print("ERROR: 'wenet' not found in PATH. Please install or add to PATH.")
         return
 
-    backend = WenetBackend(
+    config = ASRConfig(
+        workers=args.workers,
         model=args.model,
         device=args.device,
         beam=args.beam,
     )
 
-    pool = WenetWorkerPool(
-        workers=args.workers,
-        backend=backend,
-    )
+    backend = WenetBackend(config)
+
+    pool = WenetWorkerPool(config, backend)
 
     server = WenetHTTPServer((args.host, args.port), WenetHTTPRequestHandler, pool)
 

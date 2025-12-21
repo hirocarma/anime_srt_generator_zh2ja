@@ -14,19 +14,13 @@ from typing import Optional
 import wave
 import contextlib
 from dataclasses import dataclass
+from argparse import Namespace
 from typing import Optional
 
 # ---------- Config ----------
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9000
-DEFAULT_WORKERS = 2
 WENET_CMD = "wenet"
-WENET_MODEL = "wenetspeech"
-WENET_DEVICE = "cpu"  # cpu,npu,cuda
-WENET_BEAM = 40
-
-WARMUP_AUDIO = "wenet_warmup.wav"
-WARMUP_TIMEOUT = 60
 
 REQUEST_TIMEOUT = 300
 ANIME_WORDS_PATH = str(Path.home() / "etc" / "anime_words.txt")
@@ -52,13 +46,21 @@ def get_wav_duration(wav_path: str) -> float:
 
 @dataclass
 class ASRConfig:
-    workers: int
-    model: str
-    device: str
-    beam: int
+    workers: int = 2
+    model: str = "wenetspeech"
+    device: str = "cpu"
+    beam: int = 40
     min_dur: float = 1.0
     request_timeout: int = 300
-    warmup_seconds: float = 0.6
+
+    @classmethod
+    def from_args(cls, args: Namespace) -> "ASRConfig":
+        return cls(
+            workers=args.workers if args.workers is not None else cls.workers,
+            model=args.model if args.model is not None else cls.model,
+            device=args.device if args.device is not None else cls.device,
+            beam=args.beam if args.beam is not None else cls.beam,
+        )
 
 
 @dataclass
@@ -154,47 +156,8 @@ class WenetWorkerPool:
         self.config = config
         self.backend = backend
 
-        self.workers = max(1, int(config.workers))
-        self._executor = ThreadPoolExecutor(max_workers=self.workers)
-
-        self._warmup_done = False
-        self._warmup_lock = threading.Lock()
-
-    def warmup(self):
-        with self._warmup_lock:
-            if self._warmup_done:
-                return
-
-            safe_print("[warmup] running backend warmup")
-
-            tmp = Path.cwd() / WARMUP_AUDIO
-            self._create_silence_wav(tmp, self.config.warmup_seconds)
-
-            futures = []
-            for _ in range(self.workers):
-                futures.append(
-                    self._executor.submit(
-                        self.backend.transcribe,
-                        tmp,
-                        WARMUP_TIMEOUT,
-                    )
-                )
-
-            for f in futures:
-                try:
-                    r = f.result(timeout=WARMUP_TIMEOUT + 5)
-                    safe_print(
-                        f"[warmup] rc={r.rc}, out_len={len(r.text)}, err_len={len(r.stderr)}"
-                    )
-                except Exception as e:
-                    safe_print("[warmup] exception:", e)
-
-            try:
-                tmp.unlink()
-            except Exception:
-                pass
-
-            self._warmup_done = True
+        # self.workers = self.config.workers
+        self._executor = ThreadPoolExecutor(max_workers=self.config.workers)
 
     def submit(self, wav_path: str, timeout: Optional[int] = None):
         t = timeout if timeout is not None else self.config.request_timeout
@@ -208,42 +171,6 @@ class WenetWorkerPool:
             }
 
         return self._executor.submit(job)
-
-    def _create_silence_wav(self, out_path: Path, seconds: float):
-        """
-        Create a short silent WAV using ffmpeg (anullsrc).
-        """
-        if out_path.exists():
-            return
-
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "anullsrc=channel_layout=mono:sample_rate=16000",
-            "-t",
-            f"{seconds:.3f}",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-            str(out_path),
-        ]
-
-        try:
-            subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
-            safe_print(f"[warmup] created {out_path}")
-        except Exception as e:
-            safe_print(f"[warmup] ffmpeg failed to create silence: {e}")
 
     def shutdown(self, wait: bool = True):
         self._executor.shutdown(wait=wait)
@@ -297,7 +224,6 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
         timeout = int(j.get("timeout", REQUEST_TIMEOUT))
 
         # submit job
-        self.server.pool.warmup()  # ensure warmup called at least once
         fut = self.server.pool.submit(str(wav_p), timeout=timeout)
 
         try:
@@ -340,17 +266,12 @@ def main():
     ap.add_argument(
         "--workers",
         type=int,
-        default=DEFAULT_WORKERS,
         help="concurrent workers (default 2)",
     )
-    ap.add_argument(
-        "--model", default=WENET_MODEL, help="WeNet model name or local dir"
-    )
-    ap.add_argument("--device", default=WENET_DEVICE, help="WeNet device: cpu/npu/cuda")
-    ap.add_argument("--beam", type=int, default=WENET_BEAM, help="WeNet beam size")
-    ap.add_argument(
-        "--warmup", action="store_true", help="perform warmup calls on start"
-    )
+    ap.add_argument("--model", help="WeNet model name or local dir")
+    ap.add_argument("--device", help="WeNet device: cpu/npu/cuda")
+    ap.add_argument("--beam", type=int, help="WeNet beam size")
+
     args = ap.parse_args()
 
     # Check presence of wenet in PATH
@@ -358,27 +279,20 @@ def main():
         safe_print("ERROR: 'wenet' not found in PATH. Please install or add to PATH.")
         return
 
-    config = ASRConfig(
-        workers=args.workers,
-        model=args.model,
-        device=args.device,
-        beam=args.beam,
-    )
+    args = ap.parse_args()
+    config = ASRConfig.from_args(args)
 
     backend = WenetBackend(config)
-
     pool = WenetWorkerPool(config, backend)
 
     server = WenetHTTPServer((args.host, args.port), WenetHTTPRequestHandler, pool)
 
     safe_print(
-        f"[server] Listening on http://{args.host}:{args.port}  workers={args.workers}  model={args.model}"
+        f"[server] Listening on http://{args.host}:{args.port}"
+        + f" workers={config.workers} model={config.model}"
     )
 
     try:
-        if args.warmup:
-            safe_print("[server] performing warmup...")
-            pool.warmup()
         server.serve_forever()
     except KeyboardInterrupt:
         safe_print("[server] interrupted, shutting down...")

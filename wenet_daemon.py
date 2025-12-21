@@ -206,7 +206,9 @@ class WenetWorkerPool:
         self.config = config
         self.backend = backend
 
-        self._executor = ThreadPoolExecutor(max_workers=self.config.workers)
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(1, int(self.config.workers))
+        )
 
     def submit(self, wav_path: str, timeout: Optional[int] = None):
         t = timeout if timeout is not None else self.config.request_timeout

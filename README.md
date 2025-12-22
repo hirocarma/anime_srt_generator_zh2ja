@@ -278,8 +278,9 @@ POST /transcribe
 ```
 
 
+### Request body (JSON)
+
 ``` json
-Request body (JSON)
 {
   "path": "/absolute/path/to/audio.wav",
   "timeout": 300

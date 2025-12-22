@@ -216,6 +216,223 @@ You may disable any optimization depending on your environment.
 - Long videos benefit most from daemon mode and caching.
 
 ---
+
+## WeNet ASR Daemon (daemon.py)
+
+This repository also provides `daemon.py`, a lightweight HTTP daemon for running WeNet-based ASR as a persistent service.
+
+While the main scripts are designed for batch processing (video → audio → ASR → translation → SRT), `daemon.py` is intended for long-running, reusable ASR workloads, such as:
+
+- High-throughput subtitle generation pipelines
+
+- External tools calling ASR via HTTP
+
+- Avoiding repeated model initialization overhead
+
+## Overview
+
+`daemon.py` runs WeNet ASR behind a simple HTTP API.
+
+Key features:
+
+- HTTP-based ASR service (/transcribe)
+
+- Thread pool–based concurrent processing
+
+- Configurable via command-line arguments
+
+- Structured configuration using dataclasses
+
+- Robust logging (console + rotating log files)
+
+- Designed for long-running daemon usage
+
+The daemon **does not perform translation or SRT generation itself.**
+It focuses purely on **speech recognition**, making it suitable as a backend component.
+
+## Architecture
+
+High-level flow:
+
+``` 
+HTTP Request
+   ↓
+WenetHTTPRequestHandler
+   ↓
+WenetWorkerPool (ThreadPoolExecutor)
+   ↓
+WenetBackend (CLI call to `wenet`)
+   ↓
+ASR Result (JSON)
+```
+
+Each request is processed independently, while the WeNet executable is reused across requests.
+
+---
+
+## HTTP API
+### Endpoint
+
+``` bash
+POST /transcribe
+```
+
+
+``` json
+Request body (JSON)
+{
+  "path": "/absolute/path/to/audio.wav",
+  "timeout": 300
+}
+```
+
+- path (required): Absolute path to a WAV file
+
+- timeout (optional): Timeout in seconds (default from ServerConfig)
+
+### Response (JSON)
+
+``` json
+{
+  "ok": true,
+  "text": "recognized text",
+  "rc": 0,
+  "stderr": ""
+}
+```
+
+- `ok`: Whether ASR succeeded
+
+- `text`: Recognized text (empty if failed or skipped)
+
+- `rc`: Internal return code
+
+- `stderr`: Captured stderr output (if any)
+
+---
+
+## Configuration Design
+
+`daemon.py` uses explicit configuration objects instead of global constants.
+
+### ServerConfig
+
+Controls HTTP server behavior:
+
+- host
+
+- port
+
+- request_timeout
+
+### ASRConfig
+
+Controls WeNet ASR execution:
+
+- `wenet_cmd`
+
+- `workers`
+
+- `model`
+
+- `device` (`cpu`, `cuda`, `npu`)
+
+- beam
+
+- context_path
+
+- min_dur (minimum audio duration in seconds)
+
+Short audio segments shorter than min_dur are skipped early to reduce hallucinations and wasted compute.
+
+### LoggingConfig
+
+Controls logging behavior:
+
+- Log file path
+
+- Log level (INFO / DEBUG)
+
+- Rotating file handler (10MB × 5 files)
+
+All configs are validated at startup to fail fast on misconfiguration.
+
+---
+### Logging
+
+Logging is enabled for both:
+
+- Console (stdout)
+
+- Rotating log file
+
+Log format includes timestamp, log level, thread name, and logger name.
+
+Example:
+
+``` bash
+2025-01-01 12:34:56 [INFO] Thread-1 http: 127.0.0.1 - "POST /transcribe HTTP/1.1" 200
+```
+
+Use `--debug` to enable verbose logging.
+
+---
+
+### Running the Daemon
+
+Example:
+
+The following examples are all default values.
+
+``` bash
+python daemon.py \
+  --host 127.0.0.1 \
+  --port 9000 \
+  --workers 2 \
+  --model wenetspeech \
+  --device cpu \
+  --beam 40 \
+  --context_path ~/etc/anime_words.txt
+```
+
+Enable debug logging:
+
+``` bash
+python daemon.py --debug
+```
+
+Specify a custom log file:
+
+``` bash
+python daemon.py --log-file logs/custom_daemon.log
+```
+
+### Intended Use Cases
+
+`daemon.py` is recommended when:
+
+- You want to avoid repeatedly launching WeNet for each file
+
+- ASR is called frequently from external scripts or services
+
+- You want a clean separation between ASR and downstream processing
+
+- You plan to scale concurrency via worker threads
+
+For simple, one-shot subtitle generation, the batch scripts may be more convenient.
+
+### Notes
+
+- This daemon assumes **WeNet CLI** (`wenet`) is installed and available in PATH
+
+- Audio files must be **absolute paths**
+
+- The daemon does not manage audio extraction or format conversion
+
+- Translation and SRT generation are intentionally out of scope
+
+---
+
 ## License
 
 This project is provided as-is for research and personal use.

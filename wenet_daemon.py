@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 import os
+import sys
 import argparse
 import json
 import shutil
 import subprocess
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -17,6 +17,8 @@ import contextlib
 from dataclasses import dataclass
 from argparse import Namespace
 from typing import Optional
+import logging
+from logging.handlers import RotatingFileHandler
 
 
 # ---------- Config ----------
@@ -62,14 +64,25 @@ class ASRConfig:
         if not os.path.isfile(self.context_path):
             raise ValueError(f"ASRConfig.context_path {self.context_path} not found")
 
-        if self.min_dur < 0:
-            raise ValueError("ASRConfig.min_dur must be >= 0")
+        if self.min_dur <= 0:
+            raise ValueError("ASRConfig.min_dur must be > 0")
+
+
+@dataclass
+class LoggingConfig:
+    log_file: Path = Path("logs/wenet_daemon.log")
+    level: int = logging.INFO
+
+    def validate(self):
+        if self.log_file.parent:
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
 class AppConfig:
     server: ServerConfig
     asr: ASRConfig
+    logging: LoggingConfig
 
     @classmethod
     def from_args(cls, args):
@@ -85,22 +98,54 @@ class AppConfig:
                 context_path=args.context_path or ASRConfig.context_path,
                 beam=args.beam or ASRConfig.beam,
             ),
+            logging=LoggingConfig(
+                log_file=(
+                    Path(args.log_file) if args.log_file else LoggingConfig.log_file
+                ),
+                level=logging.DEBUG if args.debug else LoggingConfig.level,
+            ),
         )
 
     def validate(self):
         self.server.validate()
         self.asr.validate()
+        self.logging.validate()
 
 
 # ----------------------------
 
 
-_lock_print = threading.Lock()
+def setup_logging(
+    log_file: Path,
+    level: int = logging.INFO,
+):
+    log_file.parent.mkdir(parents=True, exist_ok=True)
 
+    formatter = logging.Formatter(
+        fmt="%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
-def safe_print(*args, **kwargs):
-    with _lock_print:
-        print(*args, **kwargs)
+    # console (stdout)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setLevel(level)
+    sh.setFormatter(formatter)
+
+    # file (rotate)
+    fh = RotatingFileHandler(
+        log_file,
+        maxBytes=10 * 1024 * 1024,  # 10MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    fh.setLevel(level)
+    fh.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.setLevel(level)
+    root.handlers.clear()
+    root.addHandler(sh)
+    root.addHandler(fh)
 
 
 def get_wav_duration(wav_path: str) -> float:
@@ -230,6 +275,14 @@ class WenetWorkerPool:
 # ---------- HTTP handler ----------
 class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
     server_version = "WenetDaemon/0.1"
+    logger = logging.getLogger("http")
+
+    def log_message(self, format, *args):
+        self.logger.info(
+            "%s - %s",
+            self.client_address[0],
+            format % args,
+        )
 
     def _send_json(self, obj: dict, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -294,10 +347,6 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
         }
         self._send_json(resp, status=200 if ok else 500)
 
-    def log_message(self, format, *args):
-        # silence default logging; print concise info
-        safe_print(f"[http] {self.client_address[0]} - {format % args}")
-
 
 # ---------- Server runner ----------
 class WenetHTTPServer(HTTPServer):
@@ -314,7 +363,6 @@ class WenetHTTPServer(HTTPServer):
 
 
 def main():
-
     ap = argparse.ArgumentParser(description="WeNet CLI daemon")
     ap.add_argument("--host", help="listen host")
     ap.add_argument("--port", type=int, help="listen port")
@@ -323,32 +371,44 @@ def main():
     ap.add_argument("--device", help="WeNet device: cpu/npu/cuda")
     ap.add_argument("--beam", type=int, help="WeNet beam size")
     ap.add_argument("--context_path", help="WeNet context_path")
+    ap.add_argument("--log-file", help="log file path")
+    ap.add_argument("--debug", action="store_true", help="enable debug logging")
 
     args = ap.parse_args()
     config = AppConfig.from_args(args)
     config.validate()
+
+    setup_logging(
+        log_file=config.logging.log_file,
+        level=config.logging.level,
+    )
+
+    logger = logging.getLogger(__name__)
 
     backend = WenetBackend(config.asr)
     pool = WenetWorkerPool(config.asr, backend)
 
     server = WenetHTTPServer(config.server, WenetHTTPRequestHandler, pool)
 
-    safe_print(
-        f"[server] Listening on http://{config.server.host}:{config.server.port}"
-        + f" workers={config.asr.workers} model={config.asr.model}"
+    logger.info(
+        "Listening on http://%s:%d workers=%d model=%s",
+        config.server.host,
+        config.server.port,
+        config.asr.workers,
+        config.asr.model,
     )
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        safe_print("[server] interrupted, shutting down...")
+        logger.info("interrupted, shutting down...")
     finally:
         try:
             server.shutdown()
         except Exception:
             pass
         pool.shutdown()
-        safe_print("[server] stopped")
+        logger.info("stopped")
 
 
 if __name__ == "__main__":

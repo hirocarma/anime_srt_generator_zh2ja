@@ -1,24 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import sys
 import argparse
+import contextlib
 import json
+import logging
+import os
 import shutil
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
-from urllib.parse import urlparse
-from typing import Optional
+import sys
 import wave
-import contextlib
 from dataclasses import dataclass
-from argparse import Namespace
-from typing import Optional
-import logging
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from typing import Optional
+from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
 
 
 # ---------- Config ----------

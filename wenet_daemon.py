@@ -172,15 +172,8 @@ class WenetBackend(ASRBackend):
     def __init__(self, config: ASRConfig):
         self.config = config
 
-    def transcribe(self, wav_path: Path, timeout: int) -> ASRResult:
-        if not wav_path.exists():
-            return ASRResult(127, "", f"file not found: {wav_path}")
-
-        dur = get_wav_duration(str(wav_path))
-        if dur < self.config.min_dur:
-            return ASRResult(0, "", f"too short ({dur:.3f}s)")
-
-        cmd = [
+    def _build_cmd(self, wav_path: Path) -> list[str]:
+        return [
             self.config.wenet_cmd,
             "-m",
             self.config.model,
@@ -197,6 +190,16 @@ class WenetBackend(ASRBackend):
             "./wenet_punc_model",
             str(wav_path),
         ]
+
+    def transcribe(self, wav_path: Path, timeout: int) -> ASRResult:
+        if not wav_path.exists():
+            return ASRResult(127, "", f"file not found: {wav_path}")
+
+        dur = get_wav_duration(str(wav_path))
+        if dur < self.config.min_dur:
+            return ASRResult(0, "", f"too short ({dur:.3f}s)")
+
+        cmd = self._build_cmd(wav_path)
 
         try:
             proc = subprocess.run(

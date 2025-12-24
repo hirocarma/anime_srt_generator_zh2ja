@@ -215,6 +215,13 @@ class WenetBackend(ASRBackend):
 
     def transcribe(self, wav_path: Path, timeout: int) -> ASRResult:
         dur = get_wav_duration(str(wav_path))
+        if dur == 0.0:
+            return ASRResult(
+                code=ASRCode.BACKEND_ERROR,
+                text="",
+                message="failed to read wav header",
+            )
+
         if dur < self.config.min_dur:
             return ASRResult(
                 code=ASRCode.NO_RESULT,

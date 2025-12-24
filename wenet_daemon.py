@@ -183,6 +183,11 @@ def setup_logging(
 
 
 class ASRBackend:
+    """
+    Base class for ASR backends.
+    Provides common audio utilities.
+    """
+
     @staticmethod
     def get_wav_duration(wav_path: Path) -> float:
         try:
@@ -319,9 +324,9 @@ class WenetWorkerPool:
             max_workers=max(1, int(self.config.workers))
         )
 
-    def submit(self, wav_path: str, timeout: int):
+    def submit(self, wav_path: Path, timeout: int):
         def job():
-            return self.backend.transcribe(Path(wav_path), timeout)
+            return self.backend.transcribe(wav_path, timeout)
 
         return self._executor.submit(job)
 
@@ -426,9 +431,10 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
         return wav_p
 
     def _run_asr(self, wav_p: Path, timeout: int):
-        fut = self.server.pool.submit(str(wav_p), timeout=timeout)
+        FUTURE_TIMEOUT_MARGIN = 30
+        fut = self.server.pool.submit(wav_p, timeout=timeout)
         try:
-            return fut.result(timeout=timeout + 30)
+            return fut.result(timeout=timeout + FUTURE_TIMEOUT_MARGIN)
         except Exception as e:
             self._send_json(
                 {"ok": False, "error": f"internal error: {e}"},

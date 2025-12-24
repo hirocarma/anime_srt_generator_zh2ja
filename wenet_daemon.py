@@ -525,7 +525,7 @@ def main():
             server.shutdown()
         except Exception:
             pass
-        pool.shutdown()
+        server.pool.shutdown()
         logger.info("stopped")
 
 

@@ -334,6 +334,7 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
     server_version = "WenetDaemon/0.2"
     logger = logging.getLogger("http")
 
+    # ---------- logging ----------
     def log_message(self, format, *args):
         self.logger.info(
             "%s - %s",
@@ -341,6 +342,7 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
             format % args,
         )
 
+    # ---------- response ----------
     def _send_json(self, obj: dict, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -349,51 +351,72 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_POST(self):
-        cfg = self.server.config
+    # ---------- helpers ----------
+    def _ensure_endpoint(self) -> bool:
         parsed = urlparse(self.path)
         if parsed.path != "/transcribe":
-            self._send_json({"ok": False, "error": "unknown endpoint"}, status=404)
-            return
+            self._send_json(
+                {"ok": False, "error": "unknown endpoint"},
+                status=404,
+            )
+            return False
+        return True
 
-        # ---- read body ----
+    def _read_json_body(self) -> dict | None:
         length = int(self.headers.get("Content-Length", 0))
         if length == 0:
-            self._send_json({"ok": False, "error": "empty body"}, status=400)
-            return
-
+            self._send_json(
+                {"ok": False, "error": "empty body"},
+                status=400,
+            )
+            return None
         try:
-            j = json.loads(self.rfile.read(length).decode("utf-8"))
+            raw = self.rfile.read(length)
+            return json.loads(raw.decode("utf-8"))
         except Exception as e:
-            self._send_json({"ok": False, "error": f"invalid json: {e}"}, status=400)
-            return
+            self._send_json(
+                {"ok": False, "error": f"invalid json: {e}"},
+                status=400,
+            )
+            return None
 
+    def _validate_wav_path(self, j: dict) -> Path | None:
         wav_path = j.get("path")
         if not wav_path:
-            self._send_json({"ok": False, "error": "missing 'path' field"}, status=400)
-            return
+            self._send_json(
+                {"ok": False, "error": "missing 'path' field"},
+                status=400,
+            )
+            return None
 
         wav_p = Path(wav_path)
         if not wav_p.is_absolute():
-            self._send_json({"ok": False, "error": "path must be absolute"}, status=400)
-            return
+            self._send_json(
+                {"ok": False, "error": "path must be absolute"},
+                status=400,
+            )
+            return None
         if not wav_p.exists():
-            self._send_json({"ok": False, "error": "file not found"}, status=404)
-            return
+            self._send_json(
+                {"ok": False, "error": "file not found"},
+                status=404,
+            )
+            return None
 
-        timeout = int(j.get("timeout", cfg.request_timeout))
+        return wav_p
 
-        # ---- submit job ----
+    def _run_asr(self, wav_p: Path, timeout: int):
         fut = self.server.pool.submit(str(wav_p), timeout=timeout)
-
         try:
-            result = fut.result(timeout=timeout + 30)
+            return fut.result(timeout=timeout + 30)
         except Exception as e:
             self._send_json(
                 {"ok": False, "error": f"internal error: {e}"},
                 status=500,
             )
-            return
+            return None
+
+    def _send_asr_result(self, result):
         if result.code.is_fatal:
             self._send_json(
                 {
@@ -405,17 +428,36 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        ok = result.code.is_ok
-
         resp = {
-            "ok": ok,
+            "ok": result.code.is_ok,
             "code": result.code.name,
             "text": result.text,
             "message": result.message,
             "stderr": result.stderr,
         }
-
         self._send_json(resp, status=200)
+
+    # ---------- main entry ----------
+    def do_POST(self):
+        if not self._ensure_endpoint():
+            return
+
+        j = self._read_json_body()
+        if j is None:
+            return
+
+        wav_p = self._validate_wav_path(j)
+        if wav_p is None:
+            return
+
+        cfg = self.server.config
+        timeout = int(j.get("timeout", cfg.request_timeout))
+
+        result = self._run_asr(wav_p, timeout)
+        if result is None:
+            return
+
+        self._send_asr_result(result)
 
 
 # ---------- Server runner ----------
@@ -433,6 +475,12 @@ class WenetHTTPServer(HTTPServer):
 
 
 def main():
+
+    def build_server(config: AppConfig) -> WenetHTTPServer:
+        backend = WenetBackend(config.asr)
+        pool = WenetWorkerPool(config.asr, backend)
+        return WenetHTTPServer(config.server, WenetHTTPRequestHandler, pool)
+
     ap = argparse.ArgumentParser(description="WeNet CLI daemon")
     ap.add_argument("--host", help="listen host")
     ap.add_argument("--port", type=int, help="listen port")
@@ -458,10 +506,7 @@ def main():
 
     logger = logging.getLogger(__name__)
 
-    backend = WenetBackend(config.asr)
-    pool = WenetWorkerPool(config.asr, backend)
-
-    server = WenetHTTPServer(config.server, WenetHTTPRequestHandler, pool)
+    server = build_server(config)
 
     logger.info(
         "Listening on http://%s:%d workers=%d model=%s",

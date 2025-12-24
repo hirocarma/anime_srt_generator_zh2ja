@@ -329,6 +329,26 @@ class WenetWorkerPool:
         self._executor.shutdown(wait=wait)
 
 
+def asr_result_to_http_response(result: ASRResult) -> tuple[int, dict]:
+    """
+    Convert ASRResult into (http_status, response_json)
+    """
+    if result.code.is_fatal:
+        return 500, {
+            "ok": False,
+            "code": result.code.name,
+            "error": result.message,
+        }
+
+    return 200, {
+        "ok": result.code.is_ok,
+        "code": result.code.name,
+        "text": result.text,
+        "message": result.message,
+        "stderr": result.stderr,
+    }
+
+
 # ---------- HTTP handler ----------
 class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
     server_version = "WenetDaemon/0.2"
@@ -416,26 +436,9 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
             )
             return None
 
-    def _send_asr_result(self, result):
-        if result.code.is_fatal:
-            self._send_json(
-                {
-                    "ok": False,
-                    "code": result.code.name,
-                    "error": result.message,
-                },
-                status=500,
-            )
-            return
-
-        resp = {
-            "ok": result.code.is_ok,
-            "code": result.code.name,
-            "text": result.text,
-            "message": result.message,
-            "stderr": result.stderr,
-        }
-        self._send_json(resp, status=200)
+    def _send_asr_result(self, result: ASRResult):
+        status, body = asr_result_to_http_response(result)
+        self._send_json(body, status=status)
 
     # ---------- main entry ----------
     def do_POST(self):

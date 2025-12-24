@@ -182,17 +182,17 @@ def setup_logging(
     root.addHandler(fh)
 
 
-def get_wav_duration(wav_path: str) -> float:
-    try:
-        with contextlib.closing(wave.open(wav_path, "rb")) as wf:
-            frames = wf.getnframes()
-            rate = wf.getframerate()
-            return frames / float(rate)
-    except Exception:
-        return 0.0
-
-
 class ASRBackend:
+    @staticmethod
+    def get_wav_duration(wav_path: Path) -> float:
+        try:
+            with contextlib.closing(wave.open(str(wav_path), "rb")) as wf:
+                frames = wf.getnframes()
+                rate = wf.getframerate()
+                return frames / float(rate)
+        except Exception:
+            return 0.0
+
     def transcribe(self, wav_path: Path, timeout: int) -> ASRResult:
         raise NotImplementedError
 
@@ -221,7 +221,7 @@ class WenetBackend(ASRBackend):
         ]
 
     def transcribe(self, wav_path: Path, timeout: int) -> ASRResult:
-        dur = get_wav_duration(str(wav_path))
+        dur = self.get_wav_duration(wav_path)
         if dur == 0.0:
             return ASRResult(
                 code=ASRCode.BACKEND_ERROR,

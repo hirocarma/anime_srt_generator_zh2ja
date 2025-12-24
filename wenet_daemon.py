@@ -387,7 +387,7 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
         fut = self.server.pool.submit(str(wav_p), timeout=timeout)
 
         try:
-            result: ASRResult = fut.result()
+            result = fut.result(timeout=timeout + 30)
         except Exception as e:
             self._send_json(
                 {"ok": False, "error": f"internal error: {e}"},

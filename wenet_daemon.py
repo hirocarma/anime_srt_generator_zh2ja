@@ -130,6 +130,13 @@ class ASRCode(Enum):
             ASRCode.EXCEPTION,
         }
 
+    @property
+    def is_ok(self) -> bool:
+        return self in {
+            ASRCode.SUCCESS,
+            ASRCode.NO_RESULT,
+        }
+
 
 @dataclass
 class ASRResult:
@@ -398,7 +405,7 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        ok = result.code == ASRCode.SUCCESS
+        ok = result.code.is_ok
 
         resp = {
             "ok": ok,

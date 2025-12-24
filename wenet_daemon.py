@@ -474,12 +474,13 @@ class WenetHTTPServer(HTTPServer):
         self.pool = pool
 
 
-def main():
+def build_server(config: AppConfig) -> WenetHTTPServer:
+    backend = WenetBackend(config.asr)
+    pool = WenetWorkerPool(config.asr, backend)
+    return WenetHTTPServer(config.server, WenetHTTPRequestHandler, pool)
 
-    def build_server(config: AppConfig) -> WenetHTTPServer:
-        backend = WenetBackend(config.asr)
-        pool = WenetWorkerPool(config.asr, backend)
-        return WenetHTTPServer(config.server, WenetHTTPRequestHandler, pool)
+
+def main():
 
     ap = argparse.ArgumentParser(description="WeNet CLI daemon")
     ap.add_argument("--host", help="listen host")

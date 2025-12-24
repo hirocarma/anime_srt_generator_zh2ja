@@ -14,9 +14,9 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Optional
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
+from enum import Enum, auto
 
 
 # ---------- Config ----------
@@ -88,6 +88,11 @@ class AppConfig:
             server=ServerConfig(
                 host=args.host or ServerConfig.host,
                 port=args.port or ServerConfig.port,
+                request_timeout=(
+                    args.request_timeout
+                    if args.request_timeout is not None
+                    else ServerConfig.request_timeout
+                ),
             ),
             asr=ASRConfig(
                 workers=args.workers or ASRConfig.workers,
@@ -108,6 +113,30 @@ class AppConfig:
         self.server.validate()
         self.asr.validate()
         self.logging.validate()
+
+
+class ASRCode(Enum):
+    SUCCESS = auto()
+    NO_RESULT = auto()
+    BACKEND_ERROR = auto()
+    TIMEOUT = auto()
+    EXCEPTION = auto()
+
+    @property
+    def is_fatal(self) -> bool:
+        return self in {
+            ASRCode.BACKEND_ERROR,
+            ASRCode.TIMEOUT,
+            ASRCode.EXCEPTION,
+        }
+
+
+@dataclass
+class ASRResult:
+    code: ASRCode
+    text: str
+    message: str = ""
+    stderr: str = ""
 
 
 # ----------------------------
@@ -156,13 +185,6 @@ def get_wav_duration(wav_path: str) -> float:
         return 0.0
 
 
-@dataclass
-class ASRResult:
-    rc: int
-    text: str
-    stderr: str
-
-
 class ASRBackend:
     def transcribe(self, wav_path: Path, timeout: int) -> ASRResult:
         raise NotImplementedError
@@ -192,12 +214,14 @@ class WenetBackend(ASRBackend):
         ]
 
     def transcribe(self, wav_path: Path, timeout: int) -> ASRResult:
-        if not wav_path.exists():
-            return ASRResult(127, "", f"file not found: {wav_path}")
-
         dur = get_wav_duration(str(wav_path))
         if dur < self.config.min_dur:
-            return ASRResult(0, "", f"too short ({dur:.3f}s)")
+            return ASRResult(
+                code=ASRCode.NO_RESULT,
+                text="",
+                message=f"too short ({dur:.3f}s)",
+                stderr="",
+            )
 
         cmd = self._build_cmd(wav_path)
 
@@ -212,18 +236,43 @@ class WenetBackend(ASRBackend):
 
             stderr_text = proc.stderr or ""
             if proc.returncode != 0:
-                return ASRResult(0, "", "asr_failed")
+                return ASRResult(
+                    code=ASRCode.BACKEND_ERROR,
+                    text="",
+                    message="wenet returned non-zero",
+                    stderr=stderr_text,
+                )
 
             candidates = self._filter_stdout(proc.stdout)
             if not candidates:
-                return ASRResult(0, "", "asr_failed")
+                return ASRResult(
+                    code=ASRCode.NO_RESULT,
+                    text="",
+                    message="asr no candidates",
+                    stderr=stderr_text,
+                )
 
-            return ASRResult(0, candidates[0], stderr_text)
+            return ASRResult(
+                code=ASRCode.SUCCESS,
+                text=candidates[0],
+                message="OK candidates",
+                stderr=stderr_text,
+            )
 
-        except subprocess.TimeoutExpired:
-            return ASRResult(124, "", f"timeout after {timeout}s")
+        except subprocess.TimeoutExpired as e:
+            return ASRResult(
+                code=ASRCode.TIMEOUT,
+                text="",
+                message=f"timeout after {timeout}s",
+                stderr=e.stderr or "",
+            )
         except Exception as e:
-            return ASRResult(1, "", f"exception: {e}")
+            return ASRResult(
+                code=ASRCode.EXCEPTION,
+                text="",
+                message=f"exception: {e}",
+                stderr="",
+            )
 
     def _filter_stdout(self, stdout: str) -> list[str]:
         lines = []
@@ -256,16 +305,9 @@ class WenetWorkerPool:
             max_workers=max(1, int(self.config.workers))
         )
 
-    def submit(self, wav_path: str, timeout: Optional[int] = None):
-        t = timeout if timeout is not None else self.config.request_timeout
-
+    def submit(self, wav_path: str, timeout: int):
         def job():
-            r = self.backend.transcribe(Path(wav_path), t)
-            return {
-                "rc": r.rc,
-                "text": r.text,
-                "stderr": r.stderr,
-            }
+            return self.backend.transcribe(Path(wav_path), timeout)
 
         return self._executor.submit(job)
 
@@ -275,7 +317,7 @@ class WenetWorkerPool:
 
 # ---------- HTTP handler ----------
 class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
-    server_version = "WenetDaemon/0.1"
+    server_version = "WenetDaemon/0.2"
     logger = logging.getLogger("http")
 
     def log_message(self, format, *args):
@@ -300,14 +342,14 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "unknown endpoint"}, status=404)
             return
 
-        # read body
+        # ---- read body ----
         length = int(self.headers.get("Content-Length", 0))
         if length == 0:
             self._send_json({"ok": False, "error": "empty body"}, status=400)
             return
-        raw = self.rfile.read(length)
+
         try:
-            j = json.loads(raw.decode("utf-8"))
+            j = json.loads(self.rfile.read(length).decode("utf-8"))
         except Exception as e:
             self._send_json({"ok": False, "error": f"invalid json: {e}"}, status=400)
             return
@@ -317,7 +359,6 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "missing 'path' field"}, status=400)
             return
 
-        # security: ensure path is absolute and exists
         wav_p = Path(wav_path)
         if not wav_p.is_absolute():
             self._send_json({"ok": False, "error": "path must be absolute"}, status=400)
@@ -326,27 +367,40 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "file not found"}, status=404)
             return
 
-        # optional params
         timeout = int(j.get("timeout", cfg.request_timeout))
 
-        # submit job
+        # ---- submit job ----
         fut = self.server.pool.submit(str(wav_p), timeout=timeout)
 
         try:
-            result = fut.result(timeout=timeout + 5)
+            result: ASRResult = fut.result()
         except Exception as e:
-            self._send_json({"ok": False, "error": f"internal error: {e}"}, status=500)
+            self._send_json(
+                {"ok": False, "error": f"internal error: {e}"},
+                status=500,
+            )
+            return
+        if result.code.is_fatal:
+            self._send_json(
+                {
+                    "ok": False,
+                    "code": result.code.name,
+                    "error": result.message,
+                },
+                status=500,
+            )
             return
 
-        # return result
-        ok = result["rc"] == 0
+        ok = result.code == ASRCode.SUCCESS
+
         resp = {
             "ok": ok,
-            "text": result["text"],
-            "rc": result["rc"],
-            "stderr": result["stderr"],
+            "code": result.code.name,
+            "text": result.text,
+            "stderr": result.stderr,
         }
-        self._send_json(resp, status=200 if ok else 500)
+
+        self._send_json(resp, status=200)
 
 
 # ---------- Server runner ----------
@@ -367,6 +421,9 @@ def main():
     ap = argparse.ArgumentParser(description="WeNet CLI daemon")
     ap.add_argument("--host", help="listen host")
     ap.add_argument("--port", type=int, help="listen port")
+    ap.add_argument(
+        "--request_timeout", type=int, help="HTTP request / ASR execution timeout"
+    )
     ap.add_argument("--workers", type=int, help="concurrent workers")
     ap.add_argument("--model", help="WeNet model name or local dir")
     ap.add_argument("--device", help="WeNet device: cpu/npu/cuda")

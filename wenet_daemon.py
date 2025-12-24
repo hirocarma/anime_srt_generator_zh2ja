@@ -404,6 +404,7 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
             "ok": ok,
             "code": result.code.name,
             "text": result.text,
+            "message": result.message,
             "stderr": result.stderr,
         }
 

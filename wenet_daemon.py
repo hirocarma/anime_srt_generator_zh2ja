@@ -684,7 +684,7 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
 
     # ---------- main entry ----------
     # pylint: disable=invalid-name
-    def do_POST(self):
+    def do_POST(self) -> None:
         """
         Handle POST requests for the /transcribe endpoint.
         """

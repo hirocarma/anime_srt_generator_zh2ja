@@ -22,11 +22,28 @@ from enum import Enum, auto
 # ---------- Config ----------
 @dataclass
 class ServerConfig:
+    """
+    Configuration for the HTTP server.
+
+    Attributes:
+        host (str): Host address to bind the server.
+        port (int): TCP port number to listen on.
+        request_timeout (int): Default timeout (in seconds) for
+            HTTP requests and ASR processing.
+    """
+
     host: str = "127.0.0.1"
     port: int = 9000
     request_timeout: int = 300
 
     def validate(self):
+        """
+        Validate server configuration values.
+
+        Raises:
+            ValueError: If the port number or timeout value is invalid.
+        """
+
         if not (0 < self.port < 65536):
             raise ValueError(f"invalid port: {self.port}")
         if self.request_timeout < 0:
@@ -35,6 +52,20 @@ class ServerConfig:
 
 @dataclass
 class ASRConfig:
+    """
+        Configuration for the ASR backend.
+
+    Attributes:
+        wenet_cmd (str): WeNet CLI command or executable path.
+        workers (int): Number of concurrent ASR worker threads.
+        model (str): WeNet model name or local directory.
+        device (str): Device for inference ("cpu", "cuda", or "npu").
+        beam (int): Beam size for beam search.
+        context_path (str): Path to context word list file.
+        min_dur (float): Minimum audio duration (seconds) required
+            to run ASR.
+    """
+
     wenet_cmd: str = "wenet"
     workers: int = 2
     model: str = "wenetspeech"
@@ -44,6 +75,14 @@ class ASRConfig:
     min_dur: float = 1.0
 
     def validate(self):
+        """
+        Validate ASR backend configuration.
+
+        Raises:
+            ValueError: If required commands, files, or parameter values
+                are invalid or missing.
+        """
+
         if shutil.which(self.wenet_cmd) is None:
             raise ValueError(f"{self.wenet_cmd} not found in PATH")
 
@@ -68,22 +107,53 @@ class ASRConfig:
 
 @dataclass
 class LoggingConfig:
+    """
+    Logging configuration.
+
+    Attributes:
+        log_file (Path): Path to the log file.
+        level (int): Logging level (e.g., logging.INFO).
+    """
+
     log_file: Path = Path("logs/wenet_daemon.log")
     level: int = logging.INFO
 
     def validate(self):
+        """
+        Ensure that the log directory exists.
+        """
+
         if self.log_file.parent:
             self.log_file.parent.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
 class AppConfig:
+    """
+    Root application configuration container.
+
+    Attributes:
+        server (ServerConfig): HTTP server configuration.
+        asr (ASRConfig): ASR backend configuration.
+        logging (LoggingConfig): Logging configuration.
+    """
+
     server: ServerConfig
     asr: ASRConfig
     logging: LoggingConfig
 
     @classmethod
     def from_args(cls, args):
+        """
+        Create AppConfig from command-line arguments.
+
+        Args:
+            args: Parsed arguments from argparse.
+
+        Returns:
+            AppConfig: Constructed application configuration.
+        """
+
         return cls(
             server=ServerConfig(
                 host=args.host or ServerConfig.host,
@@ -110,12 +180,31 @@ class AppConfig:
         )
 
     def validate(self):
+        """
+        Validate all nested configuration objects.
+        """
+
         self.server.validate()
         self.asr.validate()
         self.logging.validate()
 
 
 class ASRCode(Enum):
+    """
+    Enumeration of ASR processing result codes.
+
+    SUCCESS:
+        Recognition completed successfully.
+    NO_RESULT:
+        Audio was processed but no valid recognition result was found.
+    BACKEND_ERROR:
+        ASR backend failed or exited abnormally.
+    TIMEOUT:
+        ASR processing timed out.
+    EXCEPTION:
+        An unexpected exception occurred.
+    """
+
     SUCCESS = auto()
     NO_RESULT = auto()
     BACKEND_ERROR = auto()
@@ -124,6 +213,13 @@ class ASRCode(Enum):
 
     @property
     def is_fatal(self) -> bool:
+        """
+        Check whether this result code represents a fatal error.
+
+        Returns:
+            bool: True if the error is fatal.
+        """
+
         return self in {
             ASRCode.BACKEND_ERROR,
             ASRCode.TIMEOUT,
@@ -132,6 +228,13 @@ class ASRCode(Enum):
 
     @property
     def is_ok(self) -> bool:
+        """
+        Check whether this result code is considered a successful outcome.
+
+        Returns:
+            bool: True if the result is successful or non-fatal.
+        """
+
         return self in {
             ASRCode.SUCCESS,
             ASRCode.NO_RESULT,
@@ -140,6 +243,16 @@ class ASRCode(Enum):
 
 @dataclass
 class ASRResult:
+    """
+    Container for ASR processing results.
+
+    Attributes:
+        code (ASRCode): Result status code.
+        text (str): Recognized text.
+        message (str): Human-readable message or explanation.
+        stderr (str): Captured standard error output from backend.
+    """
+
     code: ASRCode
     text: str
     message: str = ""
@@ -153,8 +266,32 @@ def setup_logging(
     log_file: Path,
     level: int = logging.INFO,
 ):
-    log_file.parent.mkdir(parents=True, exist_ok=True)
+    """
+    Initialize application-wide logging configuration.
 
+    This function configures both console (stdout) and rotating file
+    logging with a unified format. Existing root logger handlers
+    are cleared and replaced.
+
+    Args:
+        log_file (Path):
+            Path to the log file. Parent directories are created
+            automatically if they do not exist.
+        level (int):
+            Logging level (e.g., logging.INFO, logging.DEBUG).
+
+    Side Effects:
+        - Creates the log directory if necessary.
+        - Reconfigures the root logger.
+        - Attaches a StreamHandler (stdout) and a RotatingFileHandler.
+
+    Notes:
+        - The file logger rotates when the file size exceeds 10 MB.
+        - Up to 5 backup log files are retained.
+        - UTF-8 encoding is used for file logging.
+    """
+
+    log_file.parent.mkdir(parents=True, exist_ok=True)
     formatter = logging.Formatter(
         fmt="%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -185,11 +322,23 @@ def setup_logging(
 class ASRBackend:
     """
     Base class for ASR backends.
-    Provides common audio utilities.
+
+    Provides shared audio utility methods and defines
+    the transcribe interface.
     """
 
     @staticmethod
     def get_wav_duration(wav_path: Path) -> float:
+        """
+        Get the duration of a WAV file in seconds.
+
+        Args:
+            wav_path (Path): Path to the WAV file.
+
+        Returns:
+            float: Duration in seconds, or 0.0 if reading fails.
+        """
+
         try:
             with contextlib.closing(wave.open(str(wav_path), "rb")) as wf:
                 frames = wf.getnframes()
@@ -199,10 +348,31 @@ class ASRBackend:
             return 0.0
 
     def transcribe(self, wav_path: Path, timeout: int) -> ASRResult:
+        """
+        Transcribe an audio file into text.
+
+        Args:
+            wav_path (Path): Path to the audio file.
+            timeout (int): Timeout in seconds.
+
+        Returns:
+            ASRResult: Transcription result.
+
+        Raises:
+            NotImplementedError: If not implemented by a subclass.
+        """
+
         raise NotImplementedError
 
 
 class WenetBackend(ASRBackend):
+    """
+    Initialize the WeNet backend.
+
+    Args:
+        config (ASRConfig): ASR configuration.
+    """
+
     def __init__(self, config: ASRConfig):
         self.config = config
 
@@ -226,6 +396,17 @@ class WenetBackend(ASRBackend):
         ]
 
     def transcribe(self, wav_path: Path, timeout: int) -> ASRResult:
+        """
+        Run WeNet ASR on a WAV file.
+
+        Args:
+            wav_path (Path): Path to the audio file.
+            timeout (int): Maximum execution time in seconds.
+
+        Returns:
+            ASRResult: Transcription result.
+        """
+
         dur = self.get_wav_duration(wav_path)
         if dur == 0.0:
             return ASRResult(
@@ -312,6 +493,10 @@ class WenetBackend(ASRBackend):
 
 
 class WenetWorkerPool:
+    """
+    Thread pool manager for executing ASR jobs asynchronously.
+    """
+
     def __init__(
         self,
         config: ASRConfig,
@@ -325,18 +510,42 @@ class WenetWorkerPool:
         )
 
     def submit(self, wav_path: Path, timeout: int):
+        """
+        Submit an ASR job to the worker pool.
+
+        Args:
+            wav_path (Path): Path to the audio file.
+            timeout (int): ASR timeout in seconds.
+
+        Returns:
+            Future: A future returning an ASRResult.
+        """
+
         def job():
             return self.backend.transcribe(wav_path, timeout)
 
         return self._executor.submit(job)
 
     def shutdown(self, wait: bool = True):
+        """
+        Shut down the worker pool.
+
+        Args:
+            wait (bool): Whether to wait for running jobs to finish.
+        """
+
         self._executor.shutdown(wait=wait)
 
 
 def asr_result_to_http_response(result: ASRResult) -> tuple[int, dict]:
     """
-    Convert ASRResult into (http_status, response_json)
+    Convert an ASRResult into an HTTP response payload.
+
+    Args:
+        result (ASRResult): ASR processing result.
+
+    Returns:
+        tuple[int, dict]: HTTP status code and JSON response body.
     """
     if result.code.is_fatal:
         return 500, {
@@ -356,11 +565,19 @@ def asr_result_to_http_response(result: ASRResult) -> tuple[int, dict]:
 
 # ---------- HTTP handler ----------
 class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
+    """
+    HTTP request handler providing the /transcribe ASR endpoint.
+    """
+
     server_version = "WenetDaemon/0.2"
     logger = logging.getLogger("http")
 
     # ---------- logging ----------
     def log_message(self, format, *args):
+        """
+        Override BaseHTTPRequestHandler logging to use the logging module.
+        """
+
         self.logger.info(
             "%s - %s",
             self.client_address[0],
@@ -448,6 +665,10 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
 
     # ---------- main entry ----------
     def do_POST(self):
+        """
+        Handle POST requests for the /transcribe endpoint.
+        """
+
         if not self._ensure_endpoint():
             return
 
@@ -471,6 +692,10 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
 
 # ---------- Server runner ----------
 class WenetHTTPServer(HTTPServer):
+    """
+    HTTPServer extension that holds configuration and ASR worker pool.
+    """
+
     def __init__(
         self,
         config: ServerConfig,
@@ -484,12 +709,31 @@ class WenetHTTPServer(HTTPServer):
 
 
 def build_server(config: AppConfig) -> WenetHTTPServer:
+    """
+    Build and initialize the HTTP server and ASR components.
+
+    Args:
+        config (AppConfig): Application configuration.
+
+    Returns:
+        WenetHTTPServer: Initialized server instance.
+    """
+
     backend = WenetBackend(config.asr)
     pool = WenetWorkerPool(config.asr, backend)
     return WenetHTTPServer(config.server, WenetHTTPRequestHandler, pool)
 
 
 def main():
+    """
+    Application entry point.
+
+    Responsibilities:
+        - Parse command-line arguments
+        - Build and validate configuration
+        - Initialize logging
+        - Start and gracefully shut down the HTTP server
+    """
 
     ap = argparse.ArgumentParser(description="WeNet CLI daemon")
     ap.add_argument("--host", help="listen host")

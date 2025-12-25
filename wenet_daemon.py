@@ -10,13 +10,13 @@ import shutil
 import subprocess
 import sys
 import wave
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import dataclass
+from enum import Enum, auto
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor
-from enum import Enum, auto
 
 
 # ---------- Config ----------
@@ -36,7 +36,7 @@ class ServerConfig:
     port: int = 9000
     request_timeout: int = 300
 
-    def validate(self):
+    def validate(self) -> None:
         """
         Validate server configuration values.
 
@@ -44,8 +44,8 @@ class ServerConfig:
             ValueError: If the port number or timeout value is invalid.
         """
 
-        if not (0 < self.port < 65536):
-            raise ValueError(f"invalid port: {self.port}")
+        if not 0 < self.port < 65536:
+            raise ValueError(f"Invalid port: {self.port}")
         if self.request_timeout < 0:
             raise ValueError("request_timeout must be >= 0")
 
@@ -53,7 +53,7 @@ class ServerConfig:
 @dataclass
 class ASRConfig:
     """
-        Configuration for the ASR backend.
+    Configuration for the ASR backend.
 
     Attributes:
         wenet_cmd (str): WeNet CLI command or executable path.
@@ -74,7 +74,7 @@ class ASRConfig:
     context_path: str = str(Path.home() / "etc" / "anime_words.txt")
     min_dur: float = 1.0
 
-    def validate(self):
+    def validate(self) -> None:
         """
         Validate ASR backend configuration.
 
@@ -118,7 +118,7 @@ class LoggingConfig:
     log_file: Path = Path("logs/wenet_daemon.log")
     level: int = logging.INFO
 
-    def validate(self):
+    def validate(self) -> None:
         """
         Ensure that the log directory exists.
         """
@@ -179,7 +179,7 @@ class AppConfig:
             ),
         )
 
-    def validate(self):
+    def validate(self) -> None:
         """
         Validate all nested configuration objects.
         """
@@ -265,7 +265,7 @@ class ASRResult:
 def setup_logging(
     log_file: Path,
     level: int = logging.INFO,
-):
+) -> None:
     """
     Initialize application-wide logging configuration.
 
@@ -344,7 +344,7 @@ class ASRBackend:
                 frames = wf.getnframes()
                 rate = wf.getframerate()
                 return frames / float(rate)
-        except Exception:
+        except (wave.Error, OSError):
             return 0.0
 
     def transcribe(self, wav_path: Path, timeout: int) -> ASRResult:
@@ -407,72 +407,78 @@ class WenetBackend(ASRBackend):
             ASRResult: Transcription result.
         """
 
+        result: ASRResult
+
         dur = self.get_wav_duration(wav_path)
         if dur == 0.0:
-            return ASRResult(
+            result = ASRResult(
                 code=ASRCode.BACKEND_ERROR,
                 text="",
                 message="failed to read wav header",
             )
 
-        if dur < self.config.min_dur:
-            return ASRResult(
+        elif dur < self.config.min_dur:
+            result = ASRResult(
                 code=ASRCode.NO_RESULT,
                 text="",
                 message=f"too short ({dur:.3f}s)",
                 stderr="",
             )
 
-        cmd = self._build_cmd(wav_path)
+        else:
+            cmd = self._build_cmd(wav_path)
 
-        try:
-            proc = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=timeout,
-            )
-
-            stderr_text = proc.stderr or ""
-            if proc.returncode != 0:
-                return ASRResult(
-                    code=ASRCode.BACKEND_ERROR,
-                    text="",
-                    message="wenet returned non-zero",
-                    stderr=stderr_text,
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout,
+                    check=False,  # explicitly handle returncode manually
                 )
 
-            candidates = self._filter_stdout(proc.stdout)
-            if not candidates:
-                return ASRResult(
-                    code=ASRCode.NO_RESULT,
+                stderr_text = proc.stderr or ""
+                if proc.returncode != 0:
+                    result = ASRResult(
+                        code=ASRCode.BACKEND_ERROR,
+                        text="",
+                        message="wenet returned non-zero",
+                        stderr=stderr_text,
+                    )
+                else:
+                    candidates = self._filter_stdout(proc.stdout)
+                    if not candidates:
+                        result = ASRResult(
+                            code=ASRCode.NO_RESULT,
+                            text="",
+                            message="asr no candidates",
+                            stderr=stderr_text,
+                        )
+                    else:
+                        result = ASRResult(
+                            code=ASRCode.SUCCESS,
+                            text=candidates[0],
+                            message="OK candidates",
+                            stderr=stderr_text,
+                        )
+
+            except subprocess.TimeoutExpired as e:
+                result = ASRResult(
+                    code=ASRCode.TIMEOUT,
                     text="",
-                    message="asr no candidates",
-                    stderr=stderr_text,
+                    message=f"timeout after {timeout}s",
+                    stderr=e.stderr or "",
+                )
+            except OSError as e:
+                result = ASRResult(
+                    code=ASRCode.EXCEPTION,
+                    text="",
+                    message=f"exception: {e}",
+                    stderr="",
                 )
 
-            return ASRResult(
-                code=ASRCode.SUCCESS,
-                text=candidates[0],
-                message="OK candidates",
-                stderr=stderr_text,
-            )
-
-        except subprocess.TimeoutExpired as e:
-            return ASRResult(
-                code=ASRCode.TIMEOUT,
-                text="",
-                message=f"timeout after {timeout}s",
-                stderr=e.stderr or "",
-            )
-        except Exception as e:
-            return ASRResult(
-                code=ASRCode.EXCEPTION,
-                text="",
-                message=f"exception: {e}",
-                stderr="",
-            )
+        return result
 
     def _filter_stdout(self, stdout: str) -> list[str]:
         lines = []
@@ -526,7 +532,7 @@ class WenetWorkerPool:
 
         return self._executor.submit(job)
 
-    def shutdown(self, wait: bool = True):
+    def shutdown(self, wait: bool = True) -> None:
         """
         Shut down the worker pool.
 
@@ -571,11 +577,16 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
 
     server_version = "WenetDaemon/0.2"
     logger = logging.getLogger("http")
+    FUTURE_TIMEOUT_MARGIN = 30
 
     # ---------- logging ----------
-    def log_message(self, format, *args):
+    def log_message(self, format, *args) -> None:  # pylint: disable=redefined-builtin
         """
-        Override BaseHTTPRequestHandler logging to use the logging module.
+        Override BaseHTTPRequestHandler.log_message.
+
+        Note:
+        The parameter name `format` is required to match the base class
+        signature and intentionally shadows the built-in `format()`.
         """
 
         self.logger.info(
@@ -615,7 +626,7 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
         try:
             raw = self.rfile.read(length)
             return json.loads(raw.decode("utf-8"))
-        except Exception as e:
+        except (UnicodeDecodeError, json.JSONDecodeError, OSError) as e:
             self._send_json(
                 {"ok": False, "error": f"invalid json: {e}"},
                 status=400,
@@ -648,22 +659,31 @@ class WenetHTTPRequestHandler(BaseHTTPRequestHandler):
         return wav_p
 
     def _run_asr(self, wav_p: Path, timeout: int):
-        FUTURE_TIMEOUT_MARGIN = 30
+
         fut = self.server.pool.submit(wav_p, timeout=timeout)
         try:
-            return fut.result(timeout=timeout + FUTURE_TIMEOUT_MARGIN)
-        except Exception as e:
+            return fut.result(timeout=timeout + self.FUTURE_TIMEOUT_MARGIN)
+
+        except TimeoutError:
             self._send_json(
-                {"ok": False, "error": f"internal error: {e}"},
-                status=500,
+                {"ok": False, "error": "ASR execution timeout"},
+                status=504,
             )
             return None
 
-    def _send_asr_result(self, result: ASRResult):
+        except CancelledError:
+            self._send_json(
+                {"ok": False, "error": "ASR job cancelled"},
+                status=503,
+            )
+        return None
+
+    def _send_asr_result(self, result: ASRResult) -> None:
         status, body = asr_result_to_http_response(result)
         self._send_json(body, status=status)
 
     # ---------- main entry ----------
+    # pylint: disable=invalid-name
     def do_POST(self):
         """
         Handle POST requests for the /transcribe endpoint.
@@ -777,7 +797,7 @@ def main():
     finally:
         try:
             server.shutdown()
-        except Exception:
+        except Exception:  # pylint: disable=broad-exception-caught
             pass
         server.pool.shutdown()
         logger.info("stopped")

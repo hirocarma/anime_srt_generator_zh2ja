@@ -916,6 +916,77 @@ def run_wenet_asr_with_cache(wav_path: str):
     return text
 
 
+# ===== ASR client =====
+class ASRClient:
+    def __init__(
+        self,
+        *,
+        use_cache: bool = False,
+        backend_name: str = "daemon",
+    ):
+        self.use_cache = use_cache
+        self.backend_name = backend_name
+        self.cache = ASRCache() if use_cache else None
+
+    def transcribe(self, wav_path: Path) -> ASRResult:
+        if not wav_path.exists():
+            return ASRResult(
+                code=ASRCode.EXCEPTION,
+                text="",
+                message=f"wav not found: {wav_path}",
+                backend=self.backend_name,
+            )
+
+        try:
+            # --- cache ---
+            if self.use_cache and self.cache:
+                cached = self.cache.get(wav_path)
+                if cached is not None:
+                    return ASRResult(
+                        code=ASRCode.SUCCESS,
+                        text=cached,
+                        message="cache hit",
+                        backend=self.backend_name,
+                    )
+
+            # --- daemon call ---
+            text = wenet_daemon_transcribe(wav_path)
+
+            if not text:
+                return ASRResult(
+                    code=ASRCode.NO_RESULT,
+                    text="",
+                    message="empty result",
+                    backend=self.backend_name,
+                )
+
+            # --- store cache ---
+            if self.use_cache and self.cache:
+                self.cache.set(wav_path, text)
+
+            return ASRResult(
+                code=ASRCode.SUCCESS,
+                text=text,
+                backend=self.backend_name,
+            )
+
+        except WenetDaemonError as e:
+            return ASRResult(
+                code=ASRCode.BACKEND_ERROR,
+                text="",
+                message=str(e),
+                backend=self.backend_name,
+            )
+
+        except Exception as e:
+            return ASRResult(
+                code=ASRCode.EXCEPTION,
+                text="",
+                message=str(e),
+                backend=self.backend_name,
+            )
+
+
 # ===== SRT building =====
 def build_srt_blocks(filtered, text_lines_list, args):
     blocks = []
@@ -995,6 +1066,7 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
     logger.info("Start running WeNet ASR on segments...")
 
     policy = ASRFailurePolicy(DEFAULT_ASR_POLICY, logger)
+    asr_client = ASRClient(use_cache=bool(USE_ASR_CACHE))
 
     asr_results = [None] * len(segs)
     workers = max(1, min(args.workers, max(1, os.cpu_count() - 1)))
@@ -1003,35 +1075,14 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
         futures = {}
 
         for i, (st, ed, seg_path) in enumerate(segs):
-            if USE_ASR_CACHE:
-                fut = ex.submit(run_wenet_asr_with_cache, seg_path)
-            else:
-                fut = ex.submit(wenet_daemon_transcribe, seg_path)
+            fut = ex.submit(asr_client.transcribe, seg_path)
 
             futures[fut] = (i, st, ed)
 
         for fut in tqdm(as_completed(futures), total=len(segs), desc="ASR segments"):
             i, st, ed = futures[fut]
 
-            try:
-                text = fut.result()
-                if text:
-                    result = ASRResult(
-                        code=ASRCode.SUCCESS,
-                        text=text,
-                    )
-                else:
-                    result = ASRResult(
-                        code=ASRCode.NO_RESULT,
-                        text="",
-                        message="empty result",
-                    )
-            except Exception as e:
-                result = ASRResult(
-                    code=ASRCode.EXCEPTION,
-                    text="",
-                    message=str(e),
-                )
+            result = fut.result()
 
             action = policy.handle(result, segment_index=i)
             if action != ASRAction.ACCEPT:

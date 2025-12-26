@@ -61,6 +61,8 @@ class ASRResult:
     message: str = ""
     stderr: str = ""
     backend: str = "daemon"
+    segment_index: int | None = None
+    wav_path: str | None = None
 
 
 class ASRAction(Enum):
@@ -928,13 +930,32 @@ class ASRClient:
         self.backend_name = backend_name
         self.cache = ASRCache() if use_cache else None
 
-    def transcribe(self, wav_path: Path) -> ASRResult:
+    def transcribe(
+        self,
+        wav_path: Path,
+        *,
+        segment_index: int | None = None,
+    ) -> ASRResult:
+        """
+        Transcribe a single wav segment.
+
+        Parameters
+        ----------
+        wav_path : Path
+            Path to wav file.
+        segment_index : int | None
+            Index of segment in pipeline (for traceability).
+        """
+
+        # --- wav existence check ---
         if not wav_path.exists():
             return ASRResult(
                 code=ASRCode.EXCEPTION,
                 text="",
                 message=f"wav not found: {wav_path}",
                 backend=self.backend_name,
+                segment_index=segment_index,
+                wav_path=str(wav_path),
             )
 
         try:
@@ -947,6 +968,8 @@ class ASRClient:
                         text=cached,
                         message="cache hit",
                         backend=self.backend_name,
+                        segment_index=segment_index,
+                        wav_path=str(wav_path),
                     )
 
             # --- daemon call ---
@@ -958,6 +981,8 @@ class ASRClient:
                     text="",
                     message="empty result",
                     backend=self.backend_name,
+                    segment_index=segment_index,
+                    wav_path=str(wav_path),
                 )
 
             # --- store cache ---
@@ -968,6 +993,8 @@ class ASRClient:
                 code=ASRCode.SUCCESS,
                 text=text,
                 backend=self.backend_name,
+                segment_index=segment_index,
+                wav_path=str(wav_path),
             )
 
         except WenetDaemonError as e:
@@ -976,6 +1003,8 @@ class ASRClient:
                 text="",
                 message=str(e),
                 backend=self.backend_name,
+                segment_index=segment_index,
+                wav_path=str(wav_path),
             )
 
         except Exception as e:
@@ -984,6 +1013,8 @@ class ASRClient:
                 text="",
                 message=str(e),
                 backend=self.backend_name,
+                segment_index=segment_index,
+                wav_path=str(wav_path),
             )
 
 
@@ -1011,9 +1042,12 @@ class ASRService:
 
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
             futures = {}
-
             for i, (_, _, wav_path) in enumerate(segments):
-                fut = ex.submit(self.client.transcribe, wav_path)
+                fut = ex.submit(
+                    self.client.transcribe,
+                    wav_path,
+                    segment_index=i,
+                )
                 futures[fut] = i
 
             for fut in tqdm(
@@ -1128,9 +1162,12 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
     asr_results = service.run(segs)
 
     filtered = []
-    for (st, ed, _), result in zip(segs, asr_results):
+
+    for result in asr_results:
         if result.code != ASRCode.SUCCESS or not result.text.strip():
             continue
+
+        st, ed, _ = segs[result.segment_index]
 
         text = clean_chinese_punctuation(result.text)
 

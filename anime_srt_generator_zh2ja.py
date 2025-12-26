@@ -987,6 +987,64 @@ class ASRClient:
             )
 
 
+# ===== ASR service =====
+class ASRService:
+    def __init__(
+        self,
+        *,
+        client: ASRClient,
+        policy: ASRFailurePolicy,
+        workers: int,
+        logger,
+    ):
+        self.client = client
+        self.policy = policy
+        self.workers = max(1, workers)
+        self.logger = logger
+
+    def run(self, segments):
+        """
+        segments: list of (start, end, wav_path)
+        return: filtered ASR results (same format as before)
+        """
+        asr_results = [None] * len(segments)
+
+        with ThreadPoolExecutor(max_workers=self.workers) as ex:
+            futures = {}
+
+            for i, (st, ed, wav_path) in enumerate(segments):
+                fut = ex.submit(self.client.transcribe, wav_path)
+                futures[fut] = (i, st, ed)
+
+            for fut in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="ASR segments",
+            ):
+                i, st, ed = futures[fut]
+
+                result: ASRResult = fut.result()
+
+                action = self.policy.handle(result, segment_index=i)
+                if action != ASRAction.ACCEPT:
+                    continue
+
+                text = clean_chinese_punctuation(result.text)
+
+                asr_results[i] = {
+                    "start": st,
+                    "end": ed,
+                    "zh": text,
+                }
+
+        filtered = [r for r in asr_results if r and r["zh"].strip()]
+        if not filtered:
+            print("No recognized speech found.")
+            sys.exit(0)
+
+        return filtered
+
+
 # ===== SRT building =====
 def build_srt_blocks(filtered, text_lines_list, args):
     blocks = []
@@ -1065,43 +1123,19 @@ def setup_wenet_environment():
 def run_asr_on_segments(segs, wenet_model_name, args, logger):
     logger.info("Start running WeNet ASR on segments...")
 
+    client = ASRClient(use_cache=bool(USE_ASR_CACHE))
     policy = ASRFailurePolicy(DEFAULT_ASR_POLICY, logger)
-    asr_client = ASRClient(use_cache=bool(USE_ASR_CACHE))
 
-    asr_results = [None] * len(segs)
     workers = max(1, min(args.workers, max(1, os.cpu_count() - 1)))
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {}
+    service = ASRService(
+        client=client,
+        policy=policy,
+        workers=workers,
+        logger=logger,
+    )
 
-        for i, (st, ed, seg_path) in enumerate(segs):
-            fut = ex.submit(asr_client.transcribe, seg_path)
-
-            futures[fut] = (i, st, ed)
-
-        for fut in tqdm(as_completed(futures), total=len(segs), desc="ASR segments"):
-            i, st, ed = futures[fut]
-
-            result = fut.result()
-
-            action = policy.handle(result, segment_index=i)
-            if action != ASRAction.ACCEPT:
-                continue
-
-            text = clean_chinese_punctuation(result.text)
-
-            asr_results[i] = {
-                "start": st,
-                "end": ed,
-                "zh": text,
-            }
-
-    filtered = [r for r in asr_results if r and r["zh"].strip()]
-    if not filtered:
-        print("No recognized speech found.")
-        sys.exit(0)
-
-    return filtered
+    return service.run(segs)
 
 
 def translate_zh_to_ja(filtered, args, logger):

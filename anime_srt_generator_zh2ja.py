@@ -2,30 +2,31 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import datetime
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import socket
+import sqlite3
 import subprocess
 import sys
-import os
-from pathlib import Path
-import re
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-import torch
-from opencc import OpenCC
-import sqlite3
-from threading import Lock
-import hashlib
 import threading
-import datetime
-import json
+import time
 import urllib.request
-from functools import lru_cache
-import socket
-import shutil
 import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+from pathlib import Path
+from threading import Lock
+
+import torch
 import webrtcvad
-import logging
+from opencc import OpenCC
+from tqdm import tqdm
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 # -----------------------
 # Configurable defaults

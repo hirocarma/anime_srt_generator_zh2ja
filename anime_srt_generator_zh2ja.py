@@ -18,6 +18,8 @@ import time
 import urllib.request
 import wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from enum import Enum, auto
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
@@ -28,9 +30,88 @@ from opencc import OpenCC
 from tqdm import tqdm
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-# -----------------------
-# Configurable defaults
-# -----------------------
+
+class ASRCode(Enum):
+    SUCCESS = auto()
+    NO_RESULT = auto()
+    BACKEND_ERROR = auto()
+    TIMEOUT = auto()
+    EXCEPTION = auto()
+
+    @property
+    def is_fatal(self) -> bool:
+        return self in {
+            ASRCode.BACKEND_ERROR,
+            ASRCode.TIMEOUT,
+            ASRCode.EXCEPTION,
+        }
+
+    @property
+    def is_ok(self) -> bool:
+        return self in {
+            ASRCode.SUCCESS,
+            ASRCode.NO_RESULT,
+        }
+
+
+@dataclass
+class ASRResult:
+    code: ASRCode
+    text: str
+    message: str = ""
+    stderr: str = ""
+    backend: str = "daemon"
+
+
+class ASRAction(Enum):
+    ACCEPT = auto()
+    SKIP = auto()
+    ABORT = auto()
+
+
+@dataclass(frozen=True)
+class ASRPolicyConfig:
+    code_actions: dict[ASRCode, ASRAction]
+
+    def action_for(self, code: ASRCode) -> ASRAction:
+        return self.code_actions.get(code, ASRAction.SKIP)
+
+
+DEFAULT_ASR_POLICY = ASRPolicyConfig(
+    code_actions={
+        ASRCode.SUCCESS: ASRAction.ACCEPT,
+        ASRCode.NO_RESULT: ASRAction.SKIP,
+        ASRCode.BACKEND_ERROR: ASRAction.SKIP,
+        ASRCode.TIMEOUT: ASRAction.SKIP,
+        ASRCode.EXCEPTION: ASRAction.SKIP,
+    }
+)
+
+
+class ASRFailurePolicy:
+    def __init__(self, config: ASRPolicyConfig, logger):
+        self.config = config
+        self.logger = logger
+
+    def handle(self, result: ASRResult, *, segment_index: int) -> ASRAction:
+        action = self.config.action_for(result.code)
+
+        if action != ASRAction.ACCEPT:
+            self.logger.warning(
+                "[ASR %s] seg=%d msg=%s action=%s",
+                result.code.name,
+                segment_index,
+                result.message,
+                action.name,
+            )
+
+        if action == ASRAction.ABORT:
+            raise RuntimeError(f"ASR aborted by policy: {result.code.name}")
+
+        return action
+
+
+# ===== config (constants / defaults) =====
 WENET_MODEL = "wenetspeech"
 DEFAULT_NLLB_MODEL = "facebook/nllb-200-3.3B"
 
@@ -39,7 +120,7 @@ CACHE_TRANS_DB_PATH = TRANS_TMPDIR + "/" + "translation_cache.db"
 CACHE_WENET_DB_PATH = TRANS_TMPDIR + "/" + "wenet_cache.db"
 
 USE_TRANS_CACHE = 1
-USE_ASR_CACHE = 1
+USE_ASR_CACHE = 0
 
 WENET_DAEMON_HOST = "127.0.0.1"
 WENET_DAEMON_PORT = 9000
@@ -55,15 +136,12 @@ WENET_MODEL_SRC = "/home/hiro/.wenet" + "/" + WENET_MODEL
 RAMDISK_MODEL_DIR = RAMDISK_MOUNTPOINT + "/" + WENET_MODEL
 
 PRINT_DEBUG = 1
-# -----------------------
-# Start
-# -----------------------
+
+# ===== runtime start info =====
 start_time = time.time()
 start_time_f = time.strftime("%Y/%m/%d %H:%M:%S")
 
-# -----------------------
-# Global translator setup
-# -----------------------
+# ===== global translator initialization (NLLB) =====
 print("[Init] Loading global NLLB translator...")
 
 if torch.cuda.is_available():
@@ -99,15 +177,11 @@ _global_model.eval()
 
 print("[Init] NLLB translator ready.")
 
-# Load OpenCC(global)
+# ===== global chinese converter =====
 CC_T2S = OpenCC("t2s")
 
 
-# --------------------------------------------------
-# Logger
-# --------------------------------------------------
-
-
+# ===== logging =====
 class ElapsedTimeFormatter(logging.Formatter):
     def format(self, record):
         elapsed_sec = time.time() - start_time
@@ -143,11 +217,7 @@ def setup_logger(log_file="anime_srt.log"):
     return logger
 
 
-# -----------------------
-# Utilities
-# -----------------------
-
-
+# ===== utilities (generic) =====
 def run_cmd(cmd, capture_output=False, check=True):
     if capture_output:
         p = subprocess.run(
@@ -166,6 +236,7 @@ def run_cmd(cmd, capture_output=False, check=True):
         subprocess.run(cmd, check=check, close_fds=True)
 
 
+# ===== utilities (text / srt helpers) =====
 def choose_beam_for_text(zh_text):
     def beam_for_one(s: str):
         L = max(1, len(s))
@@ -235,9 +306,7 @@ def split_two_lines(text: str, max_chars: int = 28) -> str:
     return text[:mid].strip() + "\n" + text[mid:].strip()
 
 
-# --------------------------------------------------
-# Utility: Chinese
-# --------------------------------------------------
+# ===== chinese text normalization =====
 PUNC_MAP = {"，": ",", "。": ".", "！": "!", "？": "?", "：": ":", "；": ";"}
 
 
@@ -269,11 +338,7 @@ def fix_short_zh(zh):
     return SHORT_ZH_MAP.get(zh, zh)
 
 
-# --------------------------------------------------
-# Ramdisk
-# --------------------------------------------------
-
-
+# ===== ramdisk / environment setup =====
 def mount_ramdisk(mount_point="/mnt/ramdisk", size="6G"):
     try:
         result = subprocess.run(
@@ -331,11 +396,10 @@ def ensure_wenet_model_in_ramdisk(src_model_dir: str, ramdisk_dir):
     return dst
 
 
+# ===== audio extraction / segmentation =====
 # --------------------------------------------------
 # Audio duration
 # --------------------------------------------------
-
-
 def extract_wav(input_mp4: Path, out_wav: Path):
     print(f"[INFO] Extracting audio: {input_mp4} -> {out_wav}")
     if os.path.isfile(out_wav):
@@ -529,11 +593,7 @@ def split_wav(wav_path: Path, out_dir: Path):
     return seg_info_list
 
 
-# -------------------------------------------------------
-# Wenet daemon
-# -------------------------------------------------------
-
-
+# ===== wenet daemon management =====
 def _check_daemon_alive(host=WENET_DAEMON_HOST, port=WENET_DAEMON_PORT, timeout=1.0):
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -578,9 +638,7 @@ def ensure_wenet_daemon_running(wenet_model_name):
     return False
 
 
-# -------------------------------------------------------
-# SQLite-based persistent translation cache
-# -------------------------------------------------------
+# ===== translation cache (SQLite) =====
 _cache_lock = Lock()
 _conn = sqlite3.connect(CACHE_TRANS_DB_PATH, check_same_thread=False)
 _cursor = _conn.cursor()
@@ -618,6 +676,7 @@ def cache_set(zh: str, ja: str):
         _conn.commit()
 
 
+# ===== ASR cache =====
 # -----------------------
 # ASR Cache class (improved keying: content SHA1)
 # -----------------------
@@ -705,9 +764,7 @@ class ASRCache:
             print(f"[ASR Cache] STORED for {key}")
 
 
-# ------------------------------------------------------------------
-# Translation
-# ------------------------------------------------------------------
+# ===== translation logic =====
 def _translate_batch_core(texts, beam=5):
     if not texts:
         return []
@@ -794,11 +851,7 @@ def translate_batch_to_ja(texts, beam=4):
     return results
 
 
-# ------------------------------------------------------------------
-# WeNet daemon wrapper
-# ------------------------------------------------------------------
-
-
+# ===== wenet daemon wrapper =====
 class WenetDaemonError(Exception):
     pass
 
@@ -846,6 +899,7 @@ def wenet_daemon_transcribe_cached(path_str: str) -> str:
 def run_wenet_asr_with_cache_daemon(seg_path: Path) -> str:
     return wenet_daemon_transcribe_cached(str(seg_path.resolve()))
 
+
 # instantiate ASR cache (file in cwd by default)
 asr_cache = ASRCache()
 
@@ -862,9 +916,7 @@ def run_wenet_asr_with_cache(wav_path: str):
     return text
 
 
-# ------------------------------------------------------------------
-# build SRT
-# ------------------------------------------------------------------
+# ===== SRT building =====
 def build_srt_blocks(filtered, text_lines_list, args):
     blocks = []
 
@@ -886,9 +938,7 @@ def build_srt_blocks(filtered, text_lines_list, args):
     return blocks
 
 
-# -----------------------
-# Main pipeline
-# -----------------------
+# ===== pipeline steps =====
 def prepare_input(args, logger):
     inp = Path(args.input)
     if not inp.exists():
@@ -944,9 +994,10 @@ def setup_wenet_environment():
 def run_asr_on_segments(segs, wenet_model_name, args, logger):
     logger.info("Start running WeNet ASR on segments...")
 
+    policy = ASRFailurePolicy(DEFAULT_ASR_POLICY, logger)
+
     asr_results = [None] * len(segs)
     workers = max(1, min(args.workers, max(1, os.cpu_count() - 1)))
-    print(f"  Using {workers} parallel workers for WeNet CLI")
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {}
@@ -961,13 +1012,32 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
 
         for fut in tqdm(as_completed(futures), total=len(segs), desc="ASR segments"):
             i, st, ed = futures[fut]
-            try:
-                text = fut.result() or ""
-            except Exception as e:
-                print(f"Error on segment {i}: {e}")
-                text = ""
 
-            text = clean_chinese_punctuation(text)
+            try:
+                text = fut.result()
+                if text:
+                    result = ASRResult(
+                        code=ASRCode.SUCCESS,
+                        text=text,
+                    )
+                else:
+                    result = ASRResult(
+                        code=ASRCode.NO_RESULT,
+                        text="",
+                        message="empty result",
+                    )
+            except Exception as e:
+                result = ASRResult(
+                    code=ASRCode.EXCEPTION,
+                    text="",
+                    message=str(e),
+                )
+
+            action = policy.handle(result, segment_index=i)
+            if action != ASRAction.ACCEPT:
+                continue
+
+            text = clean_chinese_punctuation(result.text)
 
             asr_results[i] = {
                 "start": st,
@@ -1075,9 +1145,7 @@ def pipeline(args):
     logger.info("====== pipeline ended ======")
 
 
-# -----------------------
-# CLI
-# -----------------------
+# ===== CLI entry point =====
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Anime full pipeline Optimized")
     parser.add_argument("input", help="input mp4 file")
@@ -1085,7 +1153,9 @@ if __name__ == "__main__":
     parser.add_argument("--tmpdir", default=TRANS_TMPDIR)
     parser.add_argument("--workers", type=int, default=4, help="workers for WeNet")
     parser.add_argument("--batch", type=int, default=16, help="translation batch size")
-    parser.add_argument("--num-threads", type=int, default=4, help="torch threads number")
+    parser.add_argument(
+        "--num-threads", type=int, default=4, help="torch threads number"
+    )
     parser.add_argument("--max-chars", type=int, default=28)
     args = parser.parse_args()
 

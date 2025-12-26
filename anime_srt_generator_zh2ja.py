@@ -1002,47 +1002,37 @@ class ASRService:
         self.workers = max(1, workers)
         self.logger = logger
 
-    def run(self, segments):
+    def run(self, segments) -> list[ASRResult]:
         """
         segments: list of (start, end, wav_path)
-        return: filtered ASR results (same format as before)
+        return: list[ASRResult] (same order as segments)
         """
-        asr_results = [None] * len(segments)
+        results: list[ASRResult | None] = [None] * len(segments)
 
         with ThreadPoolExecutor(max_workers=self.workers) as ex:
             futures = {}
 
-            for i, (st, ed, wav_path) in enumerate(segments):
+            for i, (_, _, wav_path) in enumerate(segments):
                 fut = ex.submit(self.client.transcribe, wav_path)
-                futures[fut] = (i, st, ed)
+                futures[fut] = i
 
             for fut in tqdm(
                 as_completed(futures),
                 total=len(futures),
                 desc="ASR segments",
             ):
-                i, st, ed = futures[fut]
-
+                i = futures[fut]
                 result: ASRResult = fut.result()
 
                 action = self.policy.handle(result, segment_index=i)
                 if action != ASRAction.ACCEPT:
+                    results[i] = result
                     continue
 
-                text = clean_chinese_punctuation(result.text)
+                results[i] = result
 
-                asr_results[i] = {
-                    "start": st,
-                    "end": ed,
-                    "zh": text,
-                }
-
-        filtered = [r for r in asr_results if r and r["zh"].strip()]
-        if not filtered:
-            print("No recognized speech found.")
-            sys.exit(0)
-
-        return filtered
+        # None is designed not to occur, but insurance
+        return [r for r in results if r is not None]
 
 
 # ===== SRT building =====
@@ -1135,7 +1125,28 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
         logger=logger,
     )
 
-    return service.run(segs)
+    asr_results = service.run(segs)
+
+    filtered = []
+    for (st, ed, _), result in zip(segs, asr_results):
+        if result.code != ASRCode.SUCCESS or not result.text.strip():
+            continue
+
+        text = clean_chinese_punctuation(result.text)
+
+        filtered.append(
+            {
+                "start": st,
+                "end": ed,
+                "zh": text,
+            }
+        )
+
+    if not filtered:
+        print("No recognized speech found.")
+        sys.exit(0)
+
+    return filtered
 
 
 def translate_zh_to_ja(filtered, args, logger):

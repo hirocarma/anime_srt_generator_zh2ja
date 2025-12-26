@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 import wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,6 +24,7 @@ from enum import Enum, auto
 from functools import lru_cache
 from pathlib import Path
 from threading import Lock
+from typing import Optional
 
 import torch
 import webrtcvad
@@ -858,6 +860,10 @@ class WenetDaemonError(Exception):
     pass
 
 
+class WenetDaemonTimeout(WenetDaemonError):
+    pass
+
+
 def wenet_daemon_transcribe(wav_path: Path, timeout: int = 300) -> str:
     if not wav_path.exists():
         raise WenetDaemonError(f"wav not found: {wav_path}")
@@ -879,6 +885,14 @@ def wenet_daemon_transcribe(wav_path: Path, timeout: int = 300) -> str:
     try:
         with urllib.request.urlopen(req, timeout=timeout + 5) as res:
             body = res.read().decode("utf-8")
+
+    except socket.timeout as e:
+        raise WenetDaemonTimeout(f"daemon timeout: {e}")
+
+    except urllib.error.URLError as e:
+        # connection refused / daemon down
+        raise WenetDaemonError(f"daemon connection error: {e}")
+
     except Exception as e:
         raise WenetDaemonError(f"HTTP error: {e}")
 
@@ -934,7 +948,7 @@ class ASRClient:
         self,
         wav_path: Path,
         *,
-        segment_index: int | None = None,
+        segment_index: Optional[int] = None,
     ) -> ASRResult:
         """
         Transcribe a single wav segment.
@@ -943,7 +957,7 @@ class ASRClient:
         ----------
         wav_path : Path
             Path to wav file.
-        segment_index : int | None
+        segment_index(optional) : int | None
             Index of segment in pipeline (for traceability).
         """
 
@@ -992,6 +1006,16 @@ class ASRClient:
             return ASRResult(
                 code=ASRCode.SUCCESS,
                 text=text,
+                backend=self.backend_name,
+                segment_index=segment_index,
+                wav_path=str(wav_path),
+            )
+
+        except WenetDaemonTimeout as e:
+            return ASRResult(
+                code=ASRCode.TIMEOUT,
+                text="",
+                message=str(e),
                 backend=self.backend_name,
                 segment_index=segment_index,
                 wav_path=str(wav_path),

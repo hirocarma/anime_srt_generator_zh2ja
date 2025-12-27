@@ -115,14 +115,6 @@ class ASRFailurePolicy:
         return action
 
 
-@dataclass(frozen=True)
-class ASRSegment:
-    segment_index: int
-    wav_path: Path
-    start: float
-    end: float
-
-
 @dataclass
 class ASRStats:
     total: int = 0

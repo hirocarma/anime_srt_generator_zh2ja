@@ -929,31 +929,6 @@ def wenet_daemon_transcribe(wav_path: Path, timeout: int = 300) -> str:
     return obj.get("text", "").strip()
 
 
-@lru_cache(maxsize=4096)
-def wenet_daemon_transcribe_cached(path_str: str) -> str:
-    return wenet_daemon_transcribe(Path(path_str))
-
-
-def run_wenet_asr_with_cache_daemon(seg_path: Path) -> str:
-    return wenet_daemon_transcribe_cached(str(seg_path.resolve()))
-
-
-# instantiate ASR cache (file in cwd by default)
-asr_cache = ASRCache()
-
-
-def run_wenet_asr_with_cache(wav_path: str):
-    cached = asr_cache.get(wav_path)
-    if cached is not None:
-        return cached
-
-    text = run_wenet_asr_with_cache_daemon(wav_path)
-
-    asr_cache.set(wav_path, text)
-
-    return text
-
-
 # ===== ASR client =====
 class ASRClient:
     def __init__(

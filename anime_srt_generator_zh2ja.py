@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 import wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from functools import lru_cache
 from pathlib import Path
@@ -115,6 +115,23 @@ class ASRFailurePolicy:
         return action
 
 
+@dataclass(frozen=True)
+class ASRSegment:
+    segment_index: int
+    wav_path: Path
+    start: float
+    end: float
+
+
+@dataclass
+class ASRStats:
+    total: int = 0
+    success: int = 0
+    retry: int = 0
+    code_counts: dict[ASRCode, int] = field(default_factory=dict)
+    elapsed_sec: float = 0.0
+
+
 # ===== config (constants / defaults) =====
 WENET_MODEL = "wenetspeech"
 DEFAULT_NLLB_MODEL = "facebook/nllb-200-3.3B"
@@ -125,6 +142,11 @@ CACHE_WENET_DB_PATH = TRANS_TMPDIR + "/" + "wenet_cache.db"
 
 USE_TRANS_CACHE = 1
 USE_ASR_CACHE = 0
+DEFAULT_ASR_RETRY = 2
+DEFAULT_ASR_RETRYABLE_CODES: set[ASRCode] = {
+    ASRCode.TIMEOUT,
+    ASRCode.BACKEND_ERROR,
+}
 
 WENET_DAEMON_HOST = "127.0.0.1"
 WENET_DAEMON_PORT = 9000
@@ -951,29 +973,30 @@ class ASRClient:
         segment_index: Optional[int] = None,
     ) -> ASRResult:
         """
-        Transcribe a single wav segment.
+        Perform a single ASR attempt for one wav segment.
 
-        Parameters
-        ----------
-        wav_path : Path
-            Path to wav file.
-        segment_index(optional) : int | None
-            Index of segment in pipeline (for traceability).
+        Notes
+        -----
+        - No retry logic here
+        - No policy decision here
+        - Exactly one backend call at most
         """
+
+        wav_path_str = str(wav_path)
 
         # --- wav existence check ---
         if not wav_path.exists():
             return ASRResult(
                 code=ASRCode.EXCEPTION,
                 text="",
-                message=f"wav not found: {wav_path}",
+                message=f"wav not found: {wav_path_str}",
                 backend=self.backend_name,
                 segment_index=segment_index,
-                wav_path=str(wav_path),
+                wav_path=wav_path_str,
             )
 
         try:
-            # --- cache ---
+            # --- cache lookup ---
             if self.use_cache and self.cache:
                 cached = self.cache.get(wav_path)
                 if cached is not None:
@@ -983,23 +1006,23 @@ class ASRClient:
                         message="cache hit",
                         backend=self.backend_name,
                         segment_index=segment_index,
-                        wav_path=str(wav_path),
+                        wav_path=wav_path_str,
                     )
 
-            # --- daemon call ---
+            # --- backend call ---
             text = wenet_daemon_transcribe(wav_path)
 
             if not text:
                 return ASRResult(
                     code=ASRCode.NO_RESULT,
                     text="",
-                    message="empty result",
+                    message="empty ASR result",
                     backend=self.backend_name,
                     segment_index=segment_index,
-                    wav_path=str(wav_path),
+                    wav_path=wav_path_str,
                 )
 
-            # --- store cache ---
+            # --- store cache (success only) ---
             if self.use_cache and self.cache:
                 self.cache.set(wav_path, text)
 
@@ -1008,7 +1031,7 @@ class ASRClient:
                 text=text,
                 backend=self.backend_name,
                 segment_index=segment_index,
-                wav_path=str(wav_path),
+                wav_path=wav_path_str,
             )
 
         except WenetDaemonTimeout as e:
@@ -1018,7 +1041,7 @@ class ASRClient:
                 message=str(e),
                 backend=self.backend_name,
                 segment_index=segment_index,
-                wav_path=str(wav_path),
+                wav_path=wav_path_str,
             )
 
         except WenetDaemonError as e:
@@ -1028,7 +1051,7 @@ class ASRClient:
                 message=str(e),
                 backend=self.backend_name,
                 segment_index=segment_index,
-                wav_path=str(wav_path),
+                wav_path=wav_path_str,
             )
 
         except Exception as e:
@@ -1038,7 +1061,7 @@ class ASRClient:
                 message=str(e),
                 backend=self.backend_name,
                 segment_index=segment_index,
-                wav_path=str(wav_path),
+                wav_path=wav_path_str,
             )
 
 
@@ -1048,49 +1071,86 @@ class ASRService:
         self,
         *,
         client: ASRClient,
-        policy: ASRFailurePolicy,
-        workers: int,
+        max_workers: int,
+        max_retry: int,
+        retryable_codes: set[ASRCode],
         logger,
     ):
         self.client = client
-        self.policy = policy
-        self.workers = max(1, workers)
+        self.max_workers = max_workers
+        self.max_retry = max_retry
+        self.retryable_codes = retryable_codes
         self.logger = logger
 
-    def run(self, segments) -> list[ASRResult]:
+    def run(
+        self,
+        segments: list[tuple[int, int, Path]],
+    ) -> tuple[list[ASRResult], ASRStats]:
         """
-        segments: list of (start, end, wav_path)
-        return: list[ASRResult] (same order as segments)
-        """
-        results: list[ASRResult | None] = [None] * len(segments)
+        Parameters
+        ----------
+        segments : list[(start_sec, end_sec, wav_path)]
 
-        with ThreadPoolExecutor(max_workers=self.workers) as ex:
-            futures = {}
-            for i, (_, _, wav_path) in enumerate(segments):
-                fut = ex.submit(
-                    self.client.transcribe,
+        Returns
+        -------
+        (results, stats)
+        """
+        start_time = time.time()
+        stats = ASRStats(total=len(segments))
+        results: list[ASRResult] = []
+
+        def _run_one(
+            *,
+            segment_index: int,
+            wav_path: Path,
+        ) -> ASRResult:
+            last_result: ASRResult | None = None
+
+            for attempt in range(self.max_retry + 1):
+                if attempt > 0:
+                    stats.retry += 1
+                    self.logger.debug(
+                        "Retry ASR: segment=%s attempt=%s",
+                        segment_index,
+                        attempt,
+                    )
+
+                result = self.client.transcribe(
                     wav_path,
-                    segment_index=i,
+                    segment_index=segment_index,
                 )
-                futures[fut] = i
+                last_result = result
 
-            for fut in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc="ASR segments",
-            ):
-                i = futures[fut]
-                result: ASRResult = fut.result()
+                if result.code not in self.retryable_codes:
+                    break
 
-                action = self.policy.handle(result, segment_index=i)
-                if action != ASRAction.ACCEPT:
-                    results[i] = result
-                    continue
+            return last_result  # type: ignore
 
-                results[i] = result
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {
+                executor.submit(
+                    _run_one,
+                    segment_index=i,
+                    wav_path=wav_path,
+                ): i
+                for i, (_, _, wav_path) in enumerate(segments)
+            }
 
-        # None is designed not to occur, but insurance
-        return [r for r in results if r is not None]
+            for fut in as_completed(futures):
+                result = fut.result()
+                results.append(result)
+
+                # --- stats update ---
+                stats.code_counts[result.code] = (
+                    stats.code_counts.get(result.code, 0) + 1
+                )
+
+                if result.code == ASRCode.SUCCESS:
+                    stats.success += 1
+
+        stats.elapsed_sec = time.time() - start_time
+
+        return results, stats
 
 
 # ===== SRT building =====
@@ -1171,19 +1231,33 @@ def setup_wenet_environment():
 def run_asr_on_segments(segs, wenet_model_name, args, logger):
     logger.info("Start running WeNet ASR on segments...")
 
-    client = ASRClient(use_cache=bool(USE_ASR_CACHE))
-    policy = ASRFailurePolicy(DEFAULT_ASR_POLICY, logger)
-
     workers = max(1, min(args.workers, max(1, os.cpu_count() - 1)))
 
-    service = ASRService(
-        client=client,
-        policy=policy,
-        workers=workers,
+    # --- build client ---
+    asr_client = ASRClient(
+        use_cache=USE_ASR_CACHE,
+        backend_name="daemon",
+    )
+
+    # --- build service ---
+    asr_service = ASRService(
+        client=asr_client,
+        max_workers=workers,
+        max_retry=DEFAULT_ASR_RETRY,
+        retryable_codes=DEFAULT_ASR_RETRYABLE_CODES,
         logger=logger,
     )
 
-    asr_results = service.run(segs)
+    # --- run ASR ---
+    asr_results, asr_stats = asr_service.run(segs)
+
+    logger.info(
+        "ASR finished: total=%s success=%s retry=%s elapsed=%.2fs",
+        asr_stats.total,
+        asr_stats.success,
+        asr_stats.retry,
+        asr_stats.elapsed_sec,
+    )
 
     filtered = []
 

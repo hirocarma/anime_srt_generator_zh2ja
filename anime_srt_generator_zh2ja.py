@@ -67,56 +67,6 @@ class ASRResult:
     wav_path: str | None = None
 
 
-# #######################
-# class ASRAction(Enum):
-#     ACCEPT = auto()
-#     SKIP = auto()
-#     ABORT = auto()
-
-
-# @dataclass(frozen=True)
-# class ASRPolicyConfig:
-#     code_actions: dict[ASRCode, ASRAction]
-
-#     def action_for(self, code: ASRCode) -> ASRAction:
-#         return self.code_actions.get(code, ASRAction.SKIP)
-
-
-# DEFAULT_ASR_POLICY = ASRPolicyConfig(
-#     code_actions={
-#         ASRCode.SUCCESS: ASRAction.ACCEPT,
-#         ASRCode.NO_RESULT: ASRAction.SKIP,
-#         ASRCode.BACKEND_ERROR: ASRAction.SKIP,
-#         ASRCode.TIMEOUT: ASRAction.SKIP,
-#         ASRCode.EXCEPTION: ASRAction.SKIP,
-#     }
-# )
-
-
-# class ASRFailurePolicy:
-#     def __init__(self, config: ASRPolicyConfig, logger):
-#         self.config = config
-#         self.logger = logger
-
-#     def handle(self, result: ASRResult, *, segment_index: int) -> ASRAction:
-#         action = self.config.action_for(result.code)
-
-#         if action != ASRAction.ACCEPT:
-#             self.logger.warning(
-#                 "[ASR %s] seg=%d msg=%s action=%s",
-#                 result.code.name,
-#                 segment_index,
-#                 result.message,
-#                 action.name,
-#             )
-
-#         if action == ASRAction.ABORT:
-#             raise RuntimeError(f"ASR aborted by policy: {result.code.name}")
-
-#         return action
-################
-
-
 @dataclass
 class ASRStats:
     total: int = 0

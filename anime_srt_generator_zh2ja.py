@@ -21,10 +21,9 @@ import wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from functools import lru_cache
 from pathlib import Path
 from threading import Lock
-from typing import Optional
+from typing import Iterable, Optional
 
 import torch
 import webrtcvad
@@ -90,16 +89,13 @@ class PipelineASRPolicyConfig:
 
 
 class PipelineASRPolicy:
-    def __init__(
-        self,
-        config: PipelineASRPolicyConfig,
-        logger,
-    ):
+    def __init__(self, config: PipelineASRPolicyConfig, logger):
         self.config = config
         self.logger = logger
 
     def decide(self, result: ASRResult) -> PipelineASRAction:
         code = result.code
+        idx = result.segment_index
 
         if code in self.config.accept_codes:
             return PipelineASRAction.ACCEPT
@@ -107,7 +103,7 @@ class PipelineASRPolicy:
         if code in self.config.skip_codes:
             self.logger.warning(
                 "ASR skipped: idx=%s code=%s msg=%s",
-                result.segment_index,
+                idx,
                 code.name,
                 result.message,
             )
@@ -115,18 +111,18 @@ class PipelineASRPolicy:
 
         if code in self.config.abort_codes:
             self.logger.error(
-                "ASR abort: idx=%s code=%s msg=%s wav=%s",
-                result.segment_index,
+                "ASR abort: idx=%s code=%s msg=%s",
+                idx,
                 code.name,
                 result.message,
-                result.wav_path,
             )
             return PipelineASRAction.ABORT
 
         # safety net
         self.logger.error(
-            "ASR unknown code treated as abort: %s",
-            code,
+            "ASR unknown policy fallback: idx=%s code=%s",
+            idx,
+            code.name,
         )
         return PipelineASRAction.ABORT
 
@@ -1064,40 +1060,34 @@ class ASRService:
         logger,
     ):
         self.client = client
-        self.max_workers = max_workers
+        self.max_workers = max(1, max_workers)
         self.max_retry = max_retry
         self.retryable_codes = retryable_codes
         self.logger = logger
 
-    def run(
+    def run_iter(
         self,
-        segments: list[tuple[int, int, Path]],
-    ) -> tuple[list[ASRResult], ASRStats]:
+        segments: list[tuple[float, float, Path]],
+    ) -> Iterable[ASRResult]:
         """
-        Parameters
-        ----------
-        segments : list[(start_sec, end_sec, wav_path)]
+        Yield ASRResult as soon as each segment finishes.
 
-        Returns
-        -------
-        (results, stats)
+        - parallel
+        - retry inside
+        - no policy decision here
         """
         start_time = time.time()
-        stats = ASRStats(total=len(segments))
-        results: list[ASRResult] = []
 
-        def _run_one(
-            *,
-            segment_index: int,
-            wav_path: Path,
-        ) -> ASRResult:
+        self._stats = ASRStats(total=len(segments))
+
+        def _run_one(segment_index: int, wav_path: Path) -> ASRResult:
             last_result: ASRResult | None = None
 
             for attempt in range(self.max_retry + 1):
                 if attempt > 0:
-                    stats.retry += 1
+                    self._stats.retry += 1
                     self.logger.debug(
-                        "Retry ASR: segment=%s attempt=%s",
+                        "Retry ASR: seg=%d attempt=%d",
                         segment_index,
                         attempt,
                     )
@@ -1117,27 +1107,31 @@ class ASRService:
             futures = {
                 executor.submit(
                     _run_one,
-                    segment_index=i,
-                    wav_path=wav_path,
+                    i,
+                    wav_path,
                 ): i
                 for i, (_, _, wav_path) in enumerate(segments)
             }
 
             for fut in as_completed(futures):
-                result = fut.result()
-                results.append(result)
+                result: ASRResult = fut.result()
 
                 # --- stats update ---
-                stats.code_counts[result.code] = (
-                    stats.code_counts.get(result.code, 0) + 1
+                self._stats.code_counts[result.code] = (
+                    self._stats.code_counts.get(result.code, 0) + 1
                 )
-
                 if result.code == ASRCode.SUCCESS:
-                    stats.success += 1
+                    self._stats.success += 1
 
-        stats.elapsed_sec = time.time() - start_time
+                yield result
 
-        return results, stats
+        self._stats.elapsed_sec = time.time() - start_time
+
+    def get_stats(self) -> ASRStats:
+        """
+        Valid after run_iter() is exhausted.
+        """
+        return self._stats
 
 
 # ===== SRT building =====
@@ -1220,11 +1214,13 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
 
     workers = max(1, min(args.workers, max(1, os.cpu_count() - 1)))
 
+    # --- ASR client ---
     asr_client = ASRClient(
         use_cache=USE_ASR_CACHE,
         backend_name="daemon",
     )
 
+    # --- ASR service ---
     asr_service = ASRService(
         client=asr_client,
         max_workers=workers,
@@ -1233,33 +1229,24 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
         logger=logger,
     )
 
+    # --- pipeline policy ---
     policy = PipelineASRPolicy(
         DEFAULT_PIPELINE_ASR_POLICY,
         logger,
     )
 
-    accepted: list[ASRResult] = []
-    filtered = []
+    accepted_results: list[ASRResult] = []
 
-    asr_results, asr_stats = asr_service.run(segs)
-
-    for r in tqdm(asr_results, total=len(segs), desc="ASR"):
-        action = policy.decide(r)
+    # --- streaming ASR ---
+    for result in tqdm(
+        asr_service.run_iter(segs),
+        total=len(segs),
+        desc="ASR",
+    ):
+        action = policy.decide(result)
 
         if action == PipelineASRAction.ACCEPT:
-            accepted.append(r)
-
-            st, ed, _ = segs[r.segment_index]
-            text = clean_chinese_punctuation(r.text)
-
-            if text.strip():
-                filtered.append(
-                    {
-                        "start": st,
-                        "end": ed,
-                        "zh": text,
-                    }
-                )
+            accepted_results.append(result)
 
         elif action == PipelineASRAction.SKIP:
             continue
@@ -1268,13 +1255,31 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
             logger.error("Pipeline aborted due to ASR failure")
             sys.exit(1)
 
+    # --- stats ---
+    stats = asr_service.get_stats()
     logger.info(
         "ASR finished: total=%s success=%s retry=%s elapsed=%.2fs",
-        asr_stats.total,
-        asr_stats.success,
-        asr_stats.retry,
-        asr_stats.elapsed_sec,
+        stats.total,
+        stats.success,
+        stats.retry,
+        stats.elapsed_sec,
     )
+
+    # --- build filtered segments ---
+    filtered = []
+    for r in accepted_results:
+        if not r.text.strip():
+            continue
+
+        st, ed, _ = segs[r.segment_index]
+
+        filtered.append(
+            {
+                "start": st,
+                "end": ed,
+                "zh": clean_chinese_punctuation(r.text),
+            }
+        )
 
     if not filtered:
         print("No recognized speech found.")

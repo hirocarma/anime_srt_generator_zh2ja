@@ -67,52 +67,54 @@ class ASRResult:
     wav_path: str | None = None
 
 
-class ASRAction(Enum):
-    ACCEPT = auto()
-    SKIP = auto()
-    ABORT = auto()
+# #######################
+# class ASRAction(Enum):
+#     ACCEPT = auto()
+#     SKIP = auto()
+#     ABORT = auto()
 
 
-@dataclass(frozen=True)
-class ASRPolicyConfig:
-    code_actions: dict[ASRCode, ASRAction]
+# @dataclass(frozen=True)
+# class ASRPolicyConfig:
+#     code_actions: dict[ASRCode, ASRAction]
 
-    def action_for(self, code: ASRCode) -> ASRAction:
-        return self.code_actions.get(code, ASRAction.SKIP)
-
-
-DEFAULT_ASR_POLICY = ASRPolicyConfig(
-    code_actions={
-        ASRCode.SUCCESS: ASRAction.ACCEPT,
-        ASRCode.NO_RESULT: ASRAction.SKIP,
-        ASRCode.BACKEND_ERROR: ASRAction.SKIP,
-        ASRCode.TIMEOUT: ASRAction.SKIP,
-        ASRCode.EXCEPTION: ASRAction.SKIP,
-    }
-)
+#     def action_for(self, code: ASRCode) -> ASRAction:
+#         return self.code_actions.get(code, ASRAction.SKIP)
 
 
-class ASRFailurePolicy:
-    def __init__(self, config: ASRPolicyConfig, logger):
-        self.config = config
-        self.logger = logger
+# DEFAULT_ASR_POLICY = ASRPolicyConfig(
+#     code_actions={
+#         ASRCode.SUCCESS: ASRAction.ACCEPT,
+#         ASRCode.NO_RESULT: ASRAction.SKIP,
+#         ASRCode.BACKEND_ERROR: ASRAction.SKIP,
+#         ASRCode.TIMEOUT: ASRAction.SKIP,
+#         ASRCode.EXCEPTION: ASRAction.SKIP,
+#     }
+# )
 
-    def handle(self, result: ASRResult, *, segment_index: int) -> ASRAction:
-        action = self.config.action_for(result.code)
 
-        if action != ASRAction.ACCEPT:
-            self.logger.warning(
-                "[ASR %s] seg=%d msg=%s action=%s",
-                result.code.name,
-                segment_index,
-                result.message,
-                action.name,
-            )
+# class ASRFailurePolicy:
+#     def __init__(self, config: ASRPolicyConfig, logger):
+#         self.config = config
+#         self.logger = logger
 
-        if action == ASRAction.ABORT:
-            raise RuntimeError(f"ASR aborted by policy: {result.code.name}")
+#     def handle(self, result: ASRResult, *, segment_index: int) -> ASRAction:
+#         action = self.config.action_for(result.code)
 
-        return action
+#         if action != ASRAction.ACCEPT:
+#             self.logger.warning(
+#                 "[ASR %s] seg=%d msg=%s action=%s",
+#                 result.code.name,
+#                 segment_index,
+#                 result.message,
+#                 action.name,
+#             )
+
+#         if action == ASRAction.ABORT:
+#             raise RuntimeError(f"ASR aborted by policy: {result.code.name}")
+
+#         return action
+################
 
 
 @dataclass
@@ -122,6 +124,61 @@ class ASRStats:
     retry: int = 0
     code_counts: dict[ASRCode, int] = field(default_factory=dict)
     elapsed_sec: float = 0.0
+
+
+class PipelineASRAction(Enum):
+    ACCEPT = auto()
+    SKIP = auto()
+    ABORT = auto()
+
+
+@dataclass(frozen=True)
+class PipelineASRPolicyConfig:
+    accept_codes: set[ASRCode]
+    skip_codes: set[ASRCode]
+    abort_codes: set[ASRCode]
+
+
+class PipelineASRPolicy:
+    def __init__(
+        self,
+        config: PipelineASRPolicyConfig,
+        logger,
+    ):
+        self.config = config
+        self.logger = logger
+
+    def decide(self, result: ASRResult) -> PipelineASRAction:
+        code = result.code
+
+        if code in self.config.accept_codes:
+            return PipelineASRAction.ACCEPT
+
+        if code in self.config.skip_codes:
+            self.logger.warning(
+                "ASR skipped: idx=%s code=%s msg=%s",
+                result.segment_index,
+                code.name,
+                result.message,
+            )
+            return PipelineASRAction.SKIP
+
+        if code in self.config.abort_codes:
+            self.logger.error(
+                "ASR abort: idx=%s code=%s msg=%s wav=%s",
+                result.segment_index,
+                code.name,
+                result.message,
+                result.wav_path,
+            )
+            return PipelineASRAction.ABORT
+
+        # safety net
+        self.logger.error(
+            "ASR unknown code treated as abort: %s",
+            code,
+        )
+        return PipelineASRAction.ABORT
 
 
 # ===== config (constants / defaults) =====
@@ -139,6 +196,19 @@ DEFAULT_ASR_RETRYABLE_CODES: set[ASRCode] = {
     ASRCode.TIMEOUT,
     ASRCode.BACKEND_ERROR,
 }
+DEFAULT_PIPELINE_ASR_POLICY = PipelineASRPolicyConfig(
+    accept_codes={
+        ASRCode.SUCCESS,
+    },
+    skip_codes={
+        ASRCode.NO_RESULT,
+        ASRCode.TIMEOUT,
+    },
+    abort_codes={
+        ASRCode.BACKEND_ERROR,
+        ASRCode.EXCEPTION,
+    },
+)
 
 WENET_DAEMON_HOST = "127.0.0.1"
 WENET_DAEMON_PORT = 9000
@@ -1200,13 +1270,11 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
 
     workers = max(1, min(args.workers, max(1, os.cpu_count() - 1)))
 
-    # --- build client ---
     asr_client = ASRClient(
         use_cache=USE_ASR_CACHE,
         backend_name="daemon",
     )
 
-    # --- build service ---
     asr_service = ASRService(
         client=asr_client,
         max_workers=workers,
@@ -1215,8 +1283,40 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
         logger=logger,
     )
 
-    # --- run ASR ---
+    policy = PipelineASRPolicy(
+        DEFAULT_PIPELINE_ASR_POLICY,
+        logger,
+    )
+
+    accepted: list[ASRResult] = []
+    filtered = []
+
     asr_results, asr_stats = asr_service.run(segs)
+
+    for r in tqdm(asr_results, total=len(segs), desc="ASR"):
+        action = policy.decide(r)
+
+        if action == PipelineASRAction.ACCEPT:
+            accepted.append(r)
+
+            st, ed, _ = segs[r.segment_index]
+            text = clean_chinese_punctuation(r.text)
+
+            if text.strip():
+                filtered.append(
+                    {
+                        "start": st,
+                        "end": ed,
+                        "zh": text,
+                    }
+                )
+
+        elif action == PipelineASRAction.SKIP:
+            continue
+
+        elif action == PipelineASRAction.ABORT:
+            logger.error("Pipeline aborted due to ASR failure")
+            sys.exit(1)
 
     logger.info(
         "ASR finished: total=%s success=%s retry=%s elapsed=%.2fs",
@@ -1225,24 +1325,6 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
         asr_stats.retry,
         asr_stats.elapsed_sec,
     )
-
-    filtered = []
-
-    for result in asr_results:
-        if result.code != ASRCode.SUCCESS or not result.text.strip():
-            continue
-
-        st, ed, _ = segs[result.segment_index]
-
-        text = clean_chinese_punctuation(result.text)
-
-        filtered.append(
-            {
-                "start": st,
-                "end": ed,
-                "zh": text,
-            }
-        )
 
     if not filtered:
         print("No recognized speech found.")

@@ -62,17 +62,24 @@ class ASRResult:
     message: str = ""
     stderr: str = ""
     backend: str = "daemon"
+    retry_count: int = 0
     segment_index: int | None = None
     wav_path: str | None = None
 
 
 @dataclass
 class ASRStats:
+    # --- ASR execution ---
     total: int = 0
     success: int = 0
     retry: int = 0
     code_counts: dict[ASRCode, int] = field(default_factory=dict)
     elapsed_sec: float = 0.0
+
+    # --- pipeline decision ---
+    accept: int = 0
+    skip: int = 0
+    abort: int = 0
 
 
 class PipelineASRAction(Enum):
@@ -1064,6 +1071,7 @@ class ASRService:
         self.max_retry = max_retry
         self.retryable_codes = retryable_codes
         self.logger = logger
+        self._stats = ASRStats()
 
     def run_iter(
         self,
@@ -1078,14 +1086,18 @@ class ASRService:
         """
         start_time = time.time()
 
-        self._stats = ASRStats(total=len(segments))
+        self._stats.total = len(segments)
+        self._stats.success = 0
+        self._stats.retry = 0
+        self._stats.code_counts.clear()
+        self._stats.elapsed_sec = 0.0
 
         def _run_one(segment_index: int, wav_path: Path) -> ASRResult:
             last_result: ASRResult | None = None
-
+            retry_count = 0
             for attempt in range(self.max_retry + 1):
                 if attempt > 0:
-                    self._stats.retry += 1
+                    retry_count += 1
                     self.logger.debug(
                         "Retry ASR: seg=%d attempt=%d",
                         segment_index,
@@ -1100,7 +1112,7 @@ class ASRService:
 
                 if result.code not in self.retryable_codes:
                     break
-
+            result.retry_count = retry_count
             return last_result  # type: ignore
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -1122,6 +1134,9 @@ class ASRService:
                 )
                 if result.code == ASRCode.SUCCESS:
                     self._stats.success += 1
+
+                if result.retry_count > 0:
+                    self._stats.retry += 1
 
                 yield result
 
@@ -1235,6 +1250,8 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
         logger,
     )
 
+    asr_stats = asr_service.get_stats()
+
     accepted_results: list[ASRResult] = []
 
     # --- streaming ASR ---
@@ -1246,23 +1263,32 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
         action = policy.decide(result)
 
         if action == PipelineASRAction.ACCEPT:
+            asr_stats.accept += 1
             accepted_results.append(result)
+            continue
 
         elif action == PipelineASRAction.SKIP:
+            asr_stats.skip += 1
             continue
 
         elif action == PipelineASRAction.ABORT:
+            asr_stats.abort += 1
             logger.error("Pipeline aborted due to ASR failure")
             sys.exit(1)
 
     # --- stats ---
-    stats = asr_service.get_stats()
     logger.info(
-        "ASR finished: total=%s success=%s retry=%s elapsed=%.2fs",
-        stats.total,
-        stats.success,
-        stats.retry,
-        stats.elapsed_sec,
+        "ASR finished: "
+        "total=%d success=%d retry=%d "
+        "accept=%d skip=%d abort=%d "
+        "elapsed=%.2fs",
+        asr_stats.total,
+        asr_stats.success,
+        asr_stats.retry,
+        asr_stats.accept,
+        asr_stats.skip,
+        asr_stats.abort,
+        asr_stats.elapsed_sec,
     )
 
     # --- build filtered segments ---

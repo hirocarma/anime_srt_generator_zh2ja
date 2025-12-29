@@ -1391,17 +1391,91 @@ def write_srt_files(filtered, ja_lines, args, inp: Path, logger):
     print(f"[INFO] Japanese SRT written to: {ja_srt_path}")
 
 
+class PipelineStage(Enum):
+    PREPARE = auto()
+    ASR = auto()
+    TRANSLATE = auto()
+    OUTPUT = auto()
+
+
+@dataclass
+class PipelineContext:
+    # --- fixed ---
+    args: argparse.Namespace
+    logger: logging.Logger
+
+    # --- prepare stage ---
+    inp: Optional[Path] = None
+    tmp: Optional[Path] = None
+    wav: Optional[Path] = None
+    segs: Optional[list] = None
+
+    # --- ASR stage ---
+    filtered: Optional[list] = None
+    asr_stats: Optional[ASRStats] = None
+
+    # --- translation stage ---
+    ja_lines: Optional[list] = None
+
+
+def stage_prepare(ctx: PipelineContext):
+    ctx.logger.info("Stage: PREPARE")
+
+    ctx.inp, ctx.tmp = prepare_input(ctx.args, ctx.logger)
+    ctx.wav = prepare_wav(ctx.inp, ctx.tmp)
+    ctx.segs = prepare_segments(ctx.wav, ctx.tmp, ctx.inp.stem)
+
+
+def stage_asr(ctx: PipelineContext):
+    ctx.logger.info("Stage: ASR")
+
+    wenet_model_name = setup_wenet_environment()
+
+    ctx.filtered = run_asr_on_segments(
+        ctx.segs,
+        wenet_model_name,
+        ctx.args,
+        ctx.logger,
+    )
+
+    # stats は ASRService 内で集約済み
+    # run_asr_on_segments 内で logger 出力もされる
+
+
+def stage_translate(ctx: PipelineContext):
+    ctx.logger.info("Stage: TRANSLATE")
+
+    ctx.ja_lines = translate_zh_to_ja(
+        ctx.filtered,
+        ctx.args,
+        ctx.logger,
+    )
+
+
+def stage_output(ctx: PipelineContext):
+    ctx.logger.info("Stage: OUTPUT")
+
+    write_srt_files(
+        ctx.filtered,
+        ctx.ja_lines,
+        ctx.args,
+        ctx.inp,
+        ctx.logger,
+    )
+
+
 def pipeline(args):
     logger = setup_logger()
 
-    inp, tmp = prepare_input(args, logger)
-    wav = prepare_wav(inp, tmp)
-    segs = prepare_segments(wav, tmp, inp.stem)
+    ctx = PipelineContext(
+        args=args,
+        logger=logger,
+    )
 
-    wenet_model_name = setup_wenet_environment()
-    filtered = run_asr_on_segments(segs, wenet_model_name, args, logger)
-    ja_lines = translate_zh_to_ja(filtered, args, logger)
-    write_srt_files(filtered, ja_lines, args, inp, logger)
+    stage_prepare(ctx)
+    stage_asr(ctx)
+    stage_translate(ctx)
+    stage_output(ctx)
 
     logger.info("====== pipeline ended ======")
 

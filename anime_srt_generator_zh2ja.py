@@ -12,7 +12,6 @@ import shutil
 import socket
 import sqlite3
 import subprocess
-import sys
 import threading
 import time
 import urllib.error
@@ -1086,7 +1085,7 @@ class ASRService:
         """
         start_time = time.time()
 
-        self._stats.total = len(segments)
+        self._stats.total = len(segments)  # total = number of segments (not attempts)
         self._stats.success = 0
         self._stats.retry = 0
         self._stats.code_counts.clear()
@@ -1175,8 +1174,10 @@ def build_srt_blocks(filtered, text_lines_list, args):
 def prepare_input(args, logger):
     inp = Path(args.input)
     if not inp.exists():
-        print("Input file not found:", inp)
-        sys.exit(1)
+        raise PipelineAbort(
+            f"Input file not found: {inp}",
+            stage="prepare",
+        )
 
     tmp = Path(args.tmpdir)
     tmp.mkdir(parents=True, exist_ok=True)
@@ -1273,8 +1274,10 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
 
         elif action == PipelineASRAction.ABORT:
             asr_stats.abort += 1
-            logger.error("Pipeline aborted due to ASR failure")
-            sys.exit(1)
+            raise PipelineAbort(
+                "ASR fatal error",
+                stage="asr",
+            )
 
     # --- stats ---
     logger.info(
@@ -1308,8 +1311,10 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
         )
 
     if not filtered:
-        print("No recognized speech found.")
-        sys.exit(0)
+        raise PipelineEmptyResult(
+            "No recognized speech found",
+            stage="asr",
+        )
 
     return filtered
 
@@ -1391,11 +1396,11 @@ def write_srt_files(filtered, ja_lines, args, inp: Path, logger):
     print(f"[INFO] Japanese SRT written to: {ja_srt_path}")
 
 
-class PipelineStage(Enum):
-    PREPARE = auto()
-    ASR = auto()
-    TRANSLATE = auto()
-    OUTPUT = auto()
+# class PipelineStage(Enum):
+#     PREPARE = auto()
+#     ASR = auto()
+#     TRANSLATE = auto()
+#     OUTPUT = auto()
 
 
 @dataclass
@@ -1403,6 +1408,10 @@ class PipelineContext:
     # --- fixed ---
     args: argparse.Namespace
     logger: logging.Logger
+
+    # --- pipeline state ---
+    aborted: bool = False
+    error: Exception | None = None
 
     # --- prepare stage ---
     inp: Optional[Path] = None
@@ -1416,6 +1425,28 @@ class PipelineContext:
 
     # --- translation stage ---
     ja_lines: Optional[list] = None
+
+
+class PipelineError(Exception):
+    """Base class for all pipeline errors"""
+
+    pass
+
+
+class PipelineAbort(PipelineError):
+    """
+    Fatal error that should stop the pipeline immediately.
+    """
+
+    def __init__(self, message: str, *, stage: str | None = None):
+        super().__init__(message)
+        self.stage = stage
+
+
+class PipelineEmptyResult(PipelineError):
+    def __init__(self, message: str, *, stage: str | None = None):
+        super().__init__(message)
+        self.stage = stage
 
 
 def stage_prepare(ctx: PipelineContext):
@@ -1437,9 +1468,6 @@ def stage_asr(ctx: PipelineContext):
         ctx.args,
         ctx.logger,
     )
-
-    # stats は ASRService 内で集約済み
-    # run_asr_on_segments 内で logger 出力もされる
 
 
 def stage_translate(ctx: PipelineContext):
@@ -1464,20 +1492,39 @@ def stage_output(ctx: PipelineContext):
     )
 
 
-def pipeline(args):
-    logger = setup_logger()
+def pipeline(ctx: PipelineContext):
+    try:
+        stage_prepare(ctx)
+        stage_asr(ctx)
+        stage_translate(ctx)
+        stage_output(ctx)
 
-    ctx = PipelineContext(
-        args=args,
-        logger=logger,
-    )
+    except PipelineEmptyResult as e:
+        ctx.logger.warning(
+            "Pipeline finished with no output (stage=%s): %s",
+            e.stage,
+            str(e),
+        )
+        return
 
-    stage_prepare(ctx)
-    stage_asr(ctx)
-    stage_translate(ctx)
-    stage_output(ctx)
+    except PipelineAbort as e:
+        ctx.aborted = True
+        ctx.error = e
 
-    logger.info("====== pipeline ended ======")
+        ctx.logger.error(
+            "Pipeline aborted at stage=%s: %s",
+            e.stage,
+            str(e),
+        )
+
+    except Exception as e:
+        ctx.aborted = True
+        ctx.error = e
+
+        ctx.logger.exception("Unexpected pipeline error")
+
+    finally:
+        ctx.logger.info("Pipeline finished (aborted=%s)", ctx.aborted)
 
 
 # ===== CLI entry point =====
@@ -1495,4 +1542,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     torch.set_num_threads(args.num_threads)
-    pipeline(args)
+
+    logger = setup_logger()
+
+    ctx = PipelineContext(
+        args=args,
+        logger=logger,
+    )
+
+    pipeline(ctx)

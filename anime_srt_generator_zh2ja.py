@@ -7,7 +7,6 @@ import hashlib
 import json
 import logging
 import os
-import os.path
 import re
 import shutil
 import socket
@@ -15,8 +14,7 @@ import sqlite3
 import subprocess
 import threading
 import time
-import urllib.error
-import urllib.request
+import urllib
 import wave
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,7 +22,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING, Iterable, Optional, final
+from typing import TYPE_CHECKING, Iterable, Optional
 
 import torch
 import webrtcvad

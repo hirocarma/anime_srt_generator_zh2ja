@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import os.path
 import re
 import shutil
 import socket
@@ -17,12 +18,13 @@ import time
 import urllib.error
 import urllib.request
 import wave
+from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from threading import Lock
-from typing import Iterable, Optional
+from typing import TYPE_CHECKING, Iterable, Optional, final
 
 import torch
 import webrtcvad
@@ -166,7 +168,8 @@ WENET_DAEMON_HOST = "127.0.0.1"
 WENET_DAEMON_PORT = 9000
 WENET_DAEMON_SCRIPT = os.path.dirname(__file__) + "/" + "wenet_daemon.py"
 WENET_DAEMON_URL = (
-    "http://" + WENET_DAEMON_HOST + ":" + str(WENET_DAEMON_PORT) + "/transcribe"
+    "http://" + WENET_DAEMON_HOST + ":" +
+    str(WENET_DAEMON_PORT) + "/transcribe"
 )
 
 USE_RAMDISK = 1
@@ -507,7 +510,7 @@ def split_wav(wav_path: Path, out_dir: Path):
     speech_flags = []
 
     for i in range(0, len(frames), bytes_per_frame):
-        frame = frames[i : i + bytes_per_frame]
+        frame = frames[i: i + bytes_per_frame]
         if len(frame) < bytes_per_frame:
             break
         speech_flags.append(1 if vad.is_speech(frame, sample_rate) else 0)
@@ -527,7 +530,10 @@ def split_wav(wav_path: Path, out_dir: Path):
         MAX_LEN = 9.0
 
     if PRINT_DEBUG:
-        print(f"[VAD] speech_ratio={speech_ratio:.2f} → MAX_LEN={MAX_LEN:.1f}s")
+        print(
+            f"[VAD] speech_ratio={
+                speech_ratio:.2f} → MAX_LEN={MAX_LEN:.1f}s"
+        )
 
     # -------------------------------------------------
     # Hysteresis smoothing
@@ -782,7 +788,8 @@ class ASRCache:
         if key is None:
             return None
         with self.lock, sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute("SELECT text FROM asr_cache WHERE key = ?", (key,))
+            cur = conn.execute(
+                "SELECT text FROM asr_cache WHERE key = ?", (key,))
             row = cur.fetchone()
             if row:
                 if PRINT_DEBUG:
@@ -821,7 +828,8 @@ def _translate_batch_core(texts, beam=5):
     with torch.no_grad():
         gen_out = _global_model.generate(
             **enc,
-            forced_bos_token_id=_global_tokenizer.convert_tokens_to_ids("jpn_Jpan"),
+            forced_bos_token_id=_global_tokenizer.convert_tokens_to_ids(
+                "jpn_Jpan"),
             max_new_tokens=128,
             num_beams=beam,
             num_return_sequences=1,
@@ -938,7 +946,10 @@ def wenet_daemon_transcribe(wav_path: Path, timeout: int = 300) -> str:
         raise WenetDaemonError(f"Invalid JSON from daemon: {e}, body={body}")
 
     if not obj.get("ok"):
-        raise WenetDaemonError(f"Daemon error rc={obj.get('rc')}: {obj.get('stderr')}")
+        raise WenetDaemonError(
+            f"Daemon error rc={obj.get('rc')}: {
+                obj.get('stderr')}"
+        )
 
     return obj.get("text", "").strip()
 
@@ -1085,7 +1096,8 @@ class ASRService:
         """
         start_time = time.time()
 
-        self._stats.total = len(segments)  # total = number of segments (not attempts)
+        # total = number of segments (not attempts)
+        self._stats.total = len(segments)
         self._stats.success = 0
         self._stats.retry = 0
         self._stats.code_counts.clear()
@@ -1183,7 +1195,6 @@ def prepare_input(args, logger):
     tmp.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"{args.input} start at {start_time_f}")
-    logger.info("Start pipeline")
 
     return inp, tmp
 
@@ -1321,14 +1332,17 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
 
 def translate_zh_to_ja(filtered, args, logger):
     zh_lines = [r["zh"] for r in filtered]
-    logger.info(f"Start translating {len(zh_lines)} Chinese segments -> Japanese")
+    logger.info(
+        f"Start translating {
+            len(zh_lines)} Chinese segments -> Japanese"
+    )
 
     ja_lines = []
     BATCH = args.batch
     logger.info(f"batch size: {BATCH}")
 
     for i in tqdm(range(0, len(zh_lines), BATCH), desc="Translating"):
-        batch = zh_lines[i : i + BATCH]
+        batch = zh_lines[i: i + BATCH]
         batch_fix = fix_short_zh(batch)
         beam_value = choose_beam_for_text(batch_fix)
 
@@ -1396,13 +1410,6 @@ def write_srt_files(filtered, ja_lines, args, inp: Path, logger):
     print(f"[INFO] Japanese SRT written to: {ja_srt_path}")
 
 
-# class PipelineStage(Enum):
-#     PREPARE = auto()
-#     ASR = auto()
-#     TRANSLATE = auto()
-#     OUTPUT = auto()
-
-
 @dataclass
 class PipelineContext:
     # --- fixed ---
@@ -1449,92 +1456,221 @@ class PipelineEmptyResult(PipelineError):
         self.stage = stage
 
 
-def stage_prepare(ctx: PipelineContext):
-    ctx.logger.info("Stage: PREPARE")
-
-    ctx.inp, ctx.tmp = prepare_input(ctx.args, ctx.logger)
-    ctx.wav = prepare_wav(ctx.inp, ctx.tmp)
-    ctx.segs = prepare_segments(ctx.wav, ctx.tmp, ctx.inp.stem)
+if TYPE_CHECKING:
+    from pipeline_context import PipelineContext  # noqa: F811
 
 
-def stage_asr(ctx: PipelineContext):
-    ctx.logger.info("Stage: ASR")
+class BaseStage(ABC):
+    """
+    Abstract base class for all pipeline stages.
+    """
 
-    wenet_model_name = setup_wenet_environment()
+    name: str = "base"
 
-    ctx.filtered = run_asr_on_segments(
-        ctx.segs,
-        wenet_model_name,
-        ctx.args,
-        ctx.logger,
-    )
+    def __call__(self, ctx: "PipelineContext") -> None:
+        """
+        Execute this pipeline stage.
+        """
+        ctx.logger.info("Stage start: %s", self.name)
+        self.run(ctx)
+        ctx.logger.info("Stage end: %s", self.name)
 
-
-def stage_translate(ctx: PipelineContext):
-    ctx.logger.info("Stage: TRANSLATE")
-
-    ctx.ja_lines = translate_zh_to_ja(
-        ctx.filtered,
-        ctx.args,
-        ctx.logger,
-    )
-
-
-def stage_output(ctx: PipelineContext):
-    ctx.logger.info("Stage: OUTPUT")
-
-    write_srt_files(
-        ctx.filtered,
-        ctx.ja_lines,
-        ctx.args,
-        ctx.inp,
-        ctx.logger,
-    )
+    @abstractmethod
+    def run(self, ctx: "PipelineContext") -> None:
+        """
+        Run the stage logic.
+        """
+        raise NotImplementedError
 
 
-def pipeline(ctx: PipelineContext):
+class PrepareStage(BaseStage):
+    """
+    Prepare input data for downstream stages.
+    """
+
+    name = "prepare"
+
+    def run(self, ctx: PipelineContext) -> None:
+
+        ctx.logger.info("Preparing input and audio segments")
+
+        ctx.inp, ctx.tmp = prepare_input(ctx.args, ctx.logger)
+        ctx.wav = prepare_wav(ctx.inp, ctx.tmp)
+        ctx.segs = prepare_segments(ctx.wav, ctx.tmp, ctx.inp.stem)
+
+        if not ctx.segs:
+            raise PipelineEmptyResult(
+                "No audio segments generated",
+                stage=self.name,
+            )
+
+
+class ASRStage(BaseStage):
+    """
+    Automatic Speech Recognition stage.
+
+    Runs ASR on prepared audio segments and filters results
+    using PipelineASRPolicy.
+    """
+
+    name = "asr"
+
+    def run(self, ctx: PipelineContext) -> None:
+
+        ctx.logger.info("Running ASR")
+
+        wenet_model_name = setup_wenet_environment()
+
+        ctx.filtered = run_asr_on_segments(
+            ctx.segs,
+            wenet_model_name,
+            ctx.args,
+            ctx.logger,
+        )
+
+        if not ctx.filtered:
+            raise PipelineEmptyResult(
+                "No recognized speech found",
+                stage=self.name,
+            )
+
+
+class TranslationStage(BaseStage):
+    """
+    Translation stage.
+
+    Translates ASR output text into Japanese.
+    """
+
+    name = "translation"
+
+    def run(self, ctx: PipelineContext) -> None:
+        ctx.logger.info("Translating subtitles")
+
+        if not ctx.filtered:
+            raise PipelineEmptyResult(
+                "No ASR result to translate",
+                stage=self.name,
+            )
+
+        ctx.ja_lines = translate_zh_to_ja(
+            ctx.filtered,
+            ctx.args,
+            ctx.logger,
+        )
+
+        if not ctx.ja_lines:
+            raise PipelineEmptyResult(
+                "Translation produced no output",
+                stage=self.name,
+            )
+
+
+class OutputStage(BaseStage):
+    """
+    Output stage.
+
+    Writes final subtitle files to disk.
+    """
+
+    name = "output"
+
+    def run(self, ctx: PipelineContext) -> None:
+        ctx.logger.info("Writing output files")
+
+        write_srt_files(
+            ctx.filtered,
+            ctx.ja_lines,
+            ctx.args,
+            ctx.inp,
+            ctx.logger,
+        )
+
+
+def run_pipeline(ctx: PipelineContext, stages: list[BaseStage]) -> int:
+    """
+    Run pipeline stages sequentially.
+
+    Args:
+        ctx: Shared pipeline context.
+        stages: Ordered list of pipeline stages.
+
+    Returns:
+        Exit code.
+    """
+
+    ctx.logger.info("Start Pipeline")
+
     try:
-        stage_prepare(ctx)
-        stage_asr(ctx)
-        stage_translate(ctx)
-        stage_output(ctx)
+        for stage in stages:
+            stage(ctx)
 
-    except PipelineEmptyResult as e:
+    except PipelineEmptyResult as exc:
         ctx.logger.warning(
-            "Pipeline finished with no output (stage=%s): %s",
-            e.stage,
-            str(e),
+            "Pipeline finished with empty result: %s (stage=%s)",
+            exc,
+            exc.stage,
         )
-        return
+        ctx.error = exc
+        return 0
 
-    except PipelineAbort as e:
-        ctx.aborted = True
-        ctx.error = e
-
+    except PipelineAbort as exc:
         ctx.logger.error(
-            "Pipeline aborted at stage=%s: %s",
-            e.stage,
-            str(e),
+            "Pipeline aborted: %s (stage=%s)",
+            exc,
+            exc.stage,
         )
-
-    except Exception as e:
         ctx.aborted = True
-        ctx.error = e
+        ctx.error = exc
+        return 1
 
-        ctx.logger.exception("Unexpected pipeline error")
+    except PipelineError as exc:
+        ctx.logger.error("Pipeline error: %s", exc)
+        ctx.error = exc
+        return 1
 
-    finally:
-        ctx.logger.info("Pipeline finished (aborted=%s)", ctx.aborted)
+    except Exception:
+        ctx.logger.exception("Unexpected pipeline failure")
+        return 1
+
+    ctx.logger.info("Pipeline completed successfully")
+    return 0
+
+
+def pipeline_main(args: argparse.Namespace, logger: logging.Logger) -> int:
+    """
+    Pipeline entry point.
+
+    Args:
+        args: Parsed command-line arguments.
+        logger: Logger instance.
+
+    Returns:
+        Exit code.
+    """
+    ctx = PipelineContext(args=args, logger=logger)
+
+    stages = [
+        PrepareStage(),
+        ASRStage(),
+        TranslationStage(),
+        OutputStage(),
+    ]
+
+    return run_pipeline(ctx, stages)
 
 
 # ===== CLI entry point =====
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Anime full pipeline Optimized")
+    parser = argparse.ArgumentParser(
+        description="Anime full pipeline Optimized")
     parser.add_argument("input", help="input mp4 file")
     parser.add_argument("output", nargs="?", help="output srt file")
     parser.add_argument("--tmpdir", default=TRANS_TMPDIR)
-    parser.add_argument("--workers", type=int, default=4, help="workers for WeNet")
-    parser.add_argument("--batch", type=int, default=16, help="translation batch size")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="workers for WeNet")
+    parser.add_argument("--batch", type=int, default=16,
+                        help="translation batch size")
     parser.add_argument(
         "--num-threads", type=int, default=4, help="torch threads number"
     )
@@ -1545,9 +1681,4 @@ if __name__ == "__main__":
 
     logger = setup_logger()
 
-    ctx = PipelineContext(
-        args=args,
-        logger=logger,
-    )
-
-    pipeline(ctx)
+    pipeline_main(args, logger)

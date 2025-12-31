@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING, Iterable, Optional
+from typing import TYPE_CHECKING, Iterable, Optional, Set
 
 import torch
 import webrtcvad
@@ -166,8 +166,7 @@ WENET_DAEMON_HOST = "127.0.0.1"
 WENET_DAEMON_PORT = 9000
 WENET_DAEMON_SCRIPT = os.path.dirname(__file__) + "/" + "wenet_daemon.py"
 WENET_DAEMON_URL = (
-    "http://" + WENET_DAEMON_HOST + ":" +
-    str(WENET_DAEMON_PORT) + "/transcribe"
+    "http://" + WENET_DAEMON_HOST + ":" + str(WENET_DAEMON_PORT) + "/transcribe"
 )
 
 USE_RAMDISK = 1
@@ -508,7 +507,7 @@ def split_wav(wav_path: Path, out_dir: Path):
     speech_flags = []
 
     for i in range(0, len(frames), bytes_per_frame):
-        frame = frames[i: i + bytes_per_frame]
+        frame = frames[i : i + bytes_per_frame]
         if len(frame) < bytes_per_frame:
             break
         speech_flags.append(1 if vad.is_speech(frame, sample_rate) else 0)
@@ -786,8 +785,7 @@ class ASRCache:
         if key is None:
             return None
         with self.lock, sqlite3.connect(self.db_path) as conn:
-            cur = conn.execute(
-                "SELECT text FROM asr_cache WHERE key = ?", (key,))
+            cur = conn.execute("SELECT text FROM asr_cache WHERE key = ?", (key,))
             row = cur.fetchone()
             if row:
                 if PRINT_DEBUG:
@@ -826,8 +824,7 @@ def _translate_batch_core(texts, beam=5):
     with torch.no_grad():
         gen_out = _global_model.generate(
             **enc,
-            forced_bos_token_id=_global_tokenizer.convert_tokens_to_ids(
-                "jpn_Jpan"),
+            forced_bos_token_id=_global_tokenizer.convert_tokens_to_ids("jpn_Jpan"),
             max_new_tokens=128,
             num_beams=beam,
             num_return_sequences=1,
@@ -1234,7 +1231,13 @@ def setup_wenet_environment():
     return wenet_model_name
 
 
-def run_asr_on_segments(segs, wenet_model_name, args, logger):
+def run_asr_on_segments(
+    segs,
+    wenet_model_name,
+    args,
+    logger,
+    asr_stats: ASRStats,
+):
     logger.info("Start running WeNet ASR on segments...")
 
     workers = max(1, min(args.workers, max(1, os.cpu_count() - 1)))
@@ -1259,8 +1262,6 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
         DEFAULT_PIPELINE_ASR_POLICY,
         logger,
     )
-
-    asr_stats = asr_service.get_stats()
 
     accepted_results: list[ASRResult] = []
 
@@ -1287,21 +1288,6 @@ def run_asr_on_segments(segs, wenet_model_name, args, logger):
                 "ASR fatal error",
                 stage="asr",
             )
-
-    # --- stats ---
-    logger.info(
-        "ASR finished: "
-        "total=%d success=%d retry=%d "
-        "accept=%d skip=%d abort=%d "
-        "elapsed=%.2fs",
-        asr_stats.total,
-        asr_stats.success,
-        asr_stats.retry,
-        asr_stats.accept,
-        asr_stats.skip,
-        asr_stats.abort,
-        asr_stats.elapsed_sec,
-    )
 
     # --- build filtered segments ---
     filtered = []
@@ -1340,7 +1326,7 @@ def translate_zh_to_ja(filtered, args, logger):
     logger.info(f"batch size: {BATCH}")
 
     for i in tqdm(range(0, len(zh_lines), BATCH), desc="Translating"):
-        batch = zh_lines[i: i + BATCH]
+        batch = zh_lines[i : i + BATCH]
         batch_fix = fix_short_zh(batch)
         beam_value = choose_beam_for_text(batch_fix)
 
@@ -1410,13 +1396,16 @@ def write_srt_files(filtered, ja_lines, args, inp: Path, logger):
 
 @dataclass
 class PipelineContext:
+    """
+    Shared mutable context for all pipeline stages.
+
+    Each attribute represents the result of a pipeline stage.
+    None means "not executed / not available".
+    """
+
     # --- fixed ---
     args: argparse.Namespace
     logger: logging.Logger
-
-    # --- pipeline state ---
-    aborted: bool = False
-    error: Exception | None = None
 
     # --- prepare stage ---
     inp: Optional[Path] = None
@@ -1435,8 +1424,6 @@ class PipelineContext:
 class PipelineError(Exception):
     """Base class for all pipeline errors"""
 
-    pass
-
 
 class PipelineAbort(PipelineError):
     """
@@ -1454,29 +1441,51 @@ class PipelineEmptyResult(PipelineError):
         self.stage = stage
 
 
-if TYPE_CHECKING:
-    from pipeline_context import PipelineContext  # noqa: F811
+class StageDependencyError(PipelineError):
+    """Raised when a stage dependency is not satisfied."""
 
 
 class BaseStage(ABC):
     """
     Abstract base class for all pipeline stages.
+
+    Each stage must declare:
+    - requires: context attributes required before execution
+    - provides: context attributes guaranteed after execution
     """
+
+    #: Context attribute names required before run()
+    requires: Set[str] = set()
+
+    #: Context attribute names provided after run()
+    provides: Set[str] = set()
 
     name: str = "base"
 
-    def __call__(self, ctx: "PipelineContext") -> None:
+    def check_requirements(self, ctx: PipelineContext) -> None:
         """
-        Execute this pipeline stage.
+        Check whether all required context attributes are present.
         """
-        ctx.logger.info("Stage start: %s", self.name)
-        self.run(ctx)
-        ctx.logger.info("Stage end: %s", self.name)
+        missing = [key for key in self.requires if getattr(ctx, key, None) is None]
+        if missing:
+            raise StageDependencyError(
+                f"Stage '{self.name}' requires {missing}, " f"but they are not set."
+            )
+
+    def check_provides(self, ctx: PipelineContext) -> None:
+        """
+        Check whether all provided context attributes are set.
+        """
+        missing = [key for key in self.provides if getattr(ctx, key, None) is None]
+        if missing:
+            raise PipelineError(f"Stage '{self.name}' did not provide {missing}.")
 
     @abstractmethod
-    def run(self, ctx: "PipelineContext") -> None:
+    def run(self, ctx: PipelineContext) -> None:
         """
-        Run the stage logic.
+        Execute the stage.
+
+        This method must update PipelineContext in-place.
         """
         raise NotImplementedError
 
@@ -1487,6 +1496,8 @@ class PrepareStage(BaseStage):
     """
 
     name = "prepare"
+    requires = {"args"}
+    provides = {"inp", "tmp", "wav", "segs"}
 
     def run(self, ctx: PipelineContext) -> None:
 
@@ -1512,6 +1523,8 @@ class ASRStage(BaseStage):
     """
 
     name = "asr"
+    requires = {"segs", "args", "logger"}
+    provides = {"filtered", "asr_stats"}
 
     def run(self, ctx: PipelineContext) -> None:
 
@@ -1519,11 +1532,14 @@ class ASRStage(BaseStage):
 
         wenet_model_name = setup_wenet_environment()
 
+        ctx.asr_stats = ASRStats()
+
         ctx.filtered = run_asr_on_segments(
             ctx.segs,
             wenet_model_name,
             ctx.args,
             ctx.logger,
+            ctx.asr_stats,
         )
 
         if not ctx.filtered:
@@ -1531,6 +1547,20 @@ class ASRStage(BaseStage):
                 "No recognized speech found",
                 stage=self.name,
             )
+
+        ctx.logger.info(
+            "ASR finished: "
+            "total=%d success=%d retry=%d "
+            "accept=%d skip=%d abort=%d "
+            "elapsed=%.2fs",
+            ctx.asr_stats.total,
+            ctx.asr_stats.success,
+            ctx.asr_stats.retry,
+            ctx.asr_stats.accept,
+            ctx.asr_stats.skip,
+            ctx.asr_stats.abort,
+            ctx.asr_stats.elapsed_sec,
+        )
 
 
 class TranslationStage(BaseStage):
@@ -1541,6 +1571,8 @@ class TranslationStage(BaseStage):
     """
 
     name = "translation"
+    requires = {"filtered"}
+    provides = {"ja_lines"}
 
     def run(self, ctx: PipelineContext) -> None:
         ctx.logger.info("Translating subtitles")
@@ -1572,6 +1604,8 @@ class OutputStage(BaseStage):
     """
 
     name = "output"
+    requires = {"filtered", "ja_lines"}
+    provides = set()
 
     def run(self, ctx: PipelineContext) -> None:
         ctx.logger.info("Writing output files")
@@ -1585,23 +1619,55 @@ class OutputStage(BaseStage):
         )
 
 
-def run_pipeline(ctx: PipelineContext, stages: list[BaseStage]) -> int:
+class PipelineRunner:
     """
-    Run pipeline stages sequentially.
+    Executes pipeline stages sequentially
+    with dependency checks.
+    """
+
+    def __init__(self, stages: list[BaseStage]):
+        self.stages = stages
+
+    def run(self, ctx) -> None:
+
+        ctx.logger.info("Start Pipeline")
+
+        for stage in self.stages:
+            ctx.logger.debug("Checking stage: %s", stage.name)
+            stage.check_requirements(ctx)
+
+            ctx.logger.debug("Running stage: %s", stage.name)
+            stage.run(ctx)
+
+            stage.check_provides(ctx)
+
+
+def pipeline_main(args: argparse.Namespace, logger: logging.Logger) -> int:
+    """
+    Pipeline entry point.
 
     Args:
-        ctx: Shared pipeline context.
-        stages: Ordered list of pipeline stages.
+        args: Parsed command-line arguments.
+        logger: Logger instance.
 
     Returns:
         Exit code.
     """
+    ctx = PipelineContext(args=args, logger=logger)
 
-    ctx.logger.info("Start Pipeline")
+    ctx.logger.info("Start Application")
+
+    runner = PipelineRunner(
+        stages=[
+            PrepareStage(),
+            ASRStage(),
+            TranslationStage(),
+            OutputStage(),
+        ]
+    )
 
     try:
-        for stage in stages:
-            stage(ctx)
+        runner.run(ctx)
 
     except PipelineEmptyResult as exc:
         ctx.logger.warning(
@@ -1635,40 +1701,14 @@ def run_pipeline(ctx: PipelineContext, stages: list[BaseStage]) -> int:
     return 0
 
 
-def pipeline_main(args: argparse.Namespace, logger: logging.Logger) -> int:
-    """
-    Pipeline entry point.
-
-    Args:
-        args: Parsed command-line arguments.
-        logger: Logger instance.
-
-    Returns:
-        Exit code.
-    """
-    ctx = PipelineContext(args=args, logger=logger)
-
-    stages = [
-        PrepareStage(),
-        ASRStage(),
-        TranslationStage(),
-        OutputStage(),
-    ]
-
-    return run_pipeline(ctx, stages)
-
-
 # ===== CLI entry point =====
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Anime full pipeline Optimized")
+    parser = argparse.ArgumentParser(description="Anime full pipeline Optimized")
     parser.add_argument("input", help="input mp4 file")
     parser.add_argument("output", nargs="?", help="output srt file")
     parser.add_argument("--tmpdir", default=TRANS_TMPDIR)
-    parser.add_argument("--workers", type=int, default=4,
-                        help="workers for WeNet")
-    parser.add_argument("--batch", type=int, default=16,
-                        help="translation batch size")
+    parser.add_argument("--workers", type=int, default=4, help="workers for WeNet")
+    parser.add_argument("--batch", type=int, default=16, help="translation batch size")
     parser.add_argument(
         "--num-threads", type=int, default=4, help="torch threads number"
     )

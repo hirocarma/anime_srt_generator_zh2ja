@@ -1615,10 +1615,27 @@ class OutputStage(BaseStage):
         )
 
 
-@dataclass
+class PipelineStatus(Enum):
+    """
+    Logical execution status of the pipeline.
+    """
+
+    SUCCESS = auto()
+    EMPTY_RESULT = auto()
+    ABORTED = auto()
+    ERROR = auto()
+
+
+@dataclass(frozen=True)
 class PipelineResult:
+    """
+    Final result of pipeline execution.
+
+    This is the single source of truth for pipeline outcome.
+    """
+
+    status: PipelineStatus
     exit_code: int
-    aborted: bool = False
     error: Optional[Exception] = None
 
 
@@ -1632,6 +1649,9 @@ class PipelineRunner:
         self.stages = stages
 
     def run(self, ctx: PipelineContext) -> PipelineResult:
+        """
+        Run pipeline stages and return execution result.
+        """
         ctx.logger.info("Start Pipeline")
 
         stage_names = [stage.name for stage in self.stages]
@@ -1641,9 +1661,12 @@ class PipelineRunner:
             ctx.logger.info("Dry-run mode enabled")
             for stage in self.stages:
                 ctx.logger.info("Would run stage: %s", stage.name)
-            return PipelineResult(exit_code=0)
 
-        # --- execution range ---
+            return PipelineResult(
+                status=PipelineStatus.SUCCESS,
+                exit_code=0,
+            )
+
         run_flags = self._build_run_flags(ctx, stage_names)
 
         try:
@@ -1666,7 +1689,11 @@ class PipelineRunner:
                 exc,
                 exc.stage,
             )
-            return PipelineResult(exit_code=0, error=exc)
+            return PipelineResult(
+                status=PipelineStatus.EMPTY_RESULT,
+                exit_code=0,
+                error=exc,
+            )
 
         except PipelineAbort as exc:
             ctx.logger.error(
@@ -1674,18 +1701,33 @@ class PipelineRunner:
                 exc,
                 exc.stage,
             )
-            return PipelineResult(exit_code=1, aborted=True, error=exc)
+            return PipelineResult(
+                status=PipelineStatus.ABORTED,
+                exit_code=1,
+                error=exc,
+            )
 
         except PipelineError as exc:
             ctx.logger.error("Pipeline error: %s", exc)
-            return PipelineResult(exit_code=1, error=exc)
+            return PipelineResult(
+                status=PipelineStatus.ERROR,
+                exit_code=1,
+                error=exc,
+            )
 
         except Exception as exc:
             ctx.logger.exception("Unexpected pipeline failure")
-            return PipelineResult(exit_code=1, error=exc)
+            return PipelineResult(
+                status=PipelineStatus.ERROR,
+                exit_code=1,
+                error=exc,
+            )
 
         ctx.logger.info("Pipeline completed successfully")
-        return PipelineResult(exit_code=0)
+        return PipelineResult(
+            status=PipelineStatus.SUCCESS,
+            exit_code=0,
+        )
 
     def _build_run_flags(
         self,
@@ -1730,13 +1772,6 @@ class PipelineRunner:
 def pipeline_main(args: argparse.Namespace, logger: logging.Logger) -> int:
     """
     Pipeline entry point.
-
-    Args:
-        args: Parsed command-line arguments.
-        logger: Logger instance.
-
-    Returns:
-        Exit code.
     """
     logger.info("Start Application")
 
@@ -1752,11 +1787,16 @@ def pipeline_main(args: argparse.Namespace, logger: logging.Logger) -> int:
 
     result = runner.run(ctx)
 
-    if result.aborted:
-        logger.info("Application terminated by pipeline abort")
+    logger.info(
+        "Pipeline finished with status=%s exit_code=%d",
+        result.status.name,
+        result.exit_code,
+    )
 
-    logger.info("End Application (exit_code=%d)", result.exit_code)
+    if result.error:
+        logger.debug("Pipeline error detail", exc_info=result.error)
 
+    logger.info("End Application")
     return result.exit_code
 
 

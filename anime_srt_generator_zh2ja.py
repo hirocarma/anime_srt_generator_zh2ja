@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from threading import Lock
-from typing import TYPE_CHECKING, Iterable, Optional, Set
+from typing import Iterable, Optional, Set
 
 import torch
 import webrtcvad
@@ -1062,6 +1062,13 @@ class ASRClient:
 
 # ===== ASR service =====
 class ASRService:
+    """
+    ASR execution service.
+
+    Responsible for parallel execution, retry logic,
+    and updating ASRStats.
+    """
+
     def __init__(
         self,
         *,
@@ -1069,6 +1076,7 @@ class ASRService:
         max_workers: int,
         max_retry: int,
         retryable_codes: set[ASRCode],
+        stats: ASRStats,
         logger,
     ):
         self.client = client
@@ -1076,7 +1084,7 @@ class ASRService:
         self.max_retry = max_retry
         self.retryable_codes = retryable_codes
         self.logger = logger
-        self._stats = ASRStats()
+        self._stats = stats  # Injected mutable stats (single source of truth)
 
     def run_iter(
         self,
@@ -1093,23 +1101,11 @@ class ASRService:
 
         # total = number of segments (not attempts)
         self._stats.total = len(segments)
-        self._stats.success = 0
-        self._stats.retry = 0
-        self._stats.code_counts.clear()
-        self._stats.elapsed_sec = 0.0
 
         def _run_one(segment_index: int, wav_path: Path) -> ASRResult:
             last_result: ASRResult | None = None
-            retry_count = 0
-            for attempt in range(self.max_retry + 1):
-                if attempt > 0:
-                    retry_count += 1
-                    self.logger.debug(
-                        "Retry ASR: seg=%d attempt=%d",
-                        segment_index,
-                        attempt,
-                    )
 
+            for attempt in range(self.max_retry + 1):
                 result = self.client.transcribe(
                     wav_path,
                     segment_index=segment_index,
@@ -1118,7 +1114,7 @@ class ASRService:
 
                 if result.code not in self.retryable_codes:
                     break
-            result.retry_count = retry_count
+
             return last_result  # type: ignore
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -1147,12 +1143,6 @@ class ASRService:
                 yield result
 
         self._stats.elapsed_sec = time.time() - start_time
-
-    def get_stats(self) -> ASRStats:
-        """
-        Valid after run_iter() is exhausted.
-        """
-        return self._stats
 
 
 # ===== SRT building =====
@@ -1233,7 +1223,6 @@ def setup_wenet_environment():
 
 def run_asr_on_segments(
     segs,
-    wenet_model_name,
     args,
     logger,
     asr_stats: ASRStats,
@@ -1254,6 +1243,7 @@ def run_asr_on_segments(
         max_workers=workers,
         max_retry=DEFAULT_ASR_RETRY,
         retryable_codes=DEFAULT_ASR_RETRYABLE_CODES,
+        stats=asr_stats,
         logger=logger,
     )
 
@@ -1420,6 +1410,10 @@ class PipelineContext:
     # --- translation stage ---
     ja_lines: Optional[list] = None
 
+    # --- expection ---
+    error: Optional[Exception] = None
+    aborted: bool = False
+
 
 class PipelineError(Exception):
     """Base class for all pipeline errors"""
@@ -1469,7 +1463,9 @@ class BaseStage(ABC):
         missing = [key for key in self.requires if getattr(ctx, key, None) is None]
         if missing:
             raise StageDependencyError(
-                f"Stage '{self.name}' requires {missing}, " f"but they are not set."
+                f"Stage '{self.name}' requires {
+                    missing}, "
+                f"but they are not set."
             )
 
     def check_provides(self, ctx: PipelineContext) -> None:
@@ -1527,26 +1523,18 @@ class ASRStage(BaseStage):
     provides = {"filtered", "asr_stats"}
 
     def run(self, ctx: PipelineContext) -> None:
-
         ctx.logger.info("Running ASR")
-
-        wenet_model_name = setup_wenet_environment()
 
         ctx.asr_stats = ASRStats()
 
+        wenet_model_name = setup_wenet_environment()
+
         ctx.filtered = run_asr_on_segments(
             ctx.segs,
-            wenet_model_name,
             ctx.args,
             ctx.logger,
             ctx.asr_stats,
         )
-
-        if not ctx.filtered:
-            raise PipelineEmptyResult(
-                "No recognized speech found",
-                stage=self.name,
-            )
 
         ctx.logger.info(
             "ASR finished: "
@@ -1561,6 +1549,12 @@ class ASRStage(BaseStage):
             ctx.asr_stats.abort,
             ctx.asr_stats.elapsed_sec,
         )
+
+        if not ctx.filtered:
+            raise PipelineEmptyResult(
+                "No recognized speech found",
+                stage=self.name,
+            )
 
 
 class TranslationStage(BaseStage):

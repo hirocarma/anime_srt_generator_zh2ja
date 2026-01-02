@@ -1410,10 +1410,6 @@ class PipelineContext:
     # --- translation stage ---
     ja_lines: Optional[list] = None
 
-    # --- expection ---
-    error: Optional[Exception] = None
-    aborted: bool = False
-
 
 class PipelineError(Exception):
     """Base class for all pipeline errors"""
@@ -1448,13 +1444,19 @@ class BaseStage(ABC):
     - provides: context attributes guaranteed after execution
     """
 
+    name: str = "base"
     #: Context attribute names required before run()
     requires: Set[str] = set()
-
     #: Context attribute names provided after run()
     provides: Set[str] = set()
 
-    name: str = "base"
+    def should_run(self, ctx: PipelineContext) -> bool:
+        """
+        Decide whether this stage should run.
+
+        Default: always run.
+        """
+        return True
 
     def check_requirements(self, ctx: PipelineContext) -> None:
         """
@@ -1613,27 +1615,116 @@ class OutputStage(BaseStage):
         )
 
 
+@dataclass
+class PipelineResult:
+    exit_code: int
+    aborted: bool = False
+    error: Optional[Exception] = None
+
+
 class PipelineRunner:
     """
     Executes pipeline stages sequentially
-    with dependency checks.
+    with dependency checks and partial-run support.
     """
 
     def __init__(self, stages: list[BaseStage]):
         self.stages = stages
 
-    def run(self, ctx) -> None:
-
+    def run(self, ctx: PipelineContext) -> PipelineResult:
         ctx.logger.info("Start Pipeline")
 
-        for stage in self.stages:
-            ctx.logger.debug("Checking stage: %s", stage.name)
-            stage.check_requirements(ctx)
+        stage_names = [stage.name for stage in self.stages]
 
-            ctx.logger.debug("Running stage: %s", stage.name)
-            stage.run(ctx)
+        # --- dry run ---
+        if ctx.args.dry_run:
+            ctx.logger.info("Dry-run mode enabled")
+            for stage in self.stages:
+                ctx.logger.info("Would run stage: %s", stage.name)
+            return PipelineResult(exit_code=0)
 
-            stage.check_provides(ctx)
+        # --- execution range ---
+        run_flags = self._build_run_flags(ctx, stage_names)
+
+        try:
+            for stage in self.stages:
+                if not run_flags.get(stage.name, True):
+                    ctx.logger.info("Skipping stage: %s", stage.name)
+                    continue
+
+                ctx.logger.debug("Checking stage: %s", stage.name)
+                stage.check_requirements(ctx)
+
+                ctx.logger.info("Running stage: %s", stage.name)
+                stage.run(ctx)
+
+                stage.check_provides(ctx)
+
+        except PipelineEmptyResult as exc:
+            ctx.logger.warning(
+                "Pipeline finished with empty result: %s (stage=%s)",
+                exc,
+                exc.stage,
+            )
+            return PipelineResult(exit_code=0, error=exc)
+
+        except PipelineAbort as exc:
+            ctx.logger.error(
+                "Pipeline aborted: %s (stage=%s)",
+                exc,
+                exc.stage,
+            )
+            return PipelineResult(exit_code=1, aborted=True, error=exc)
+
+        except PipelineError as exc:
+            ctx.logger.error("Pipeline error: %s", exc)
+            return PipelineResult(exit_code=1, error=exc)
+
+        except Exception as exc:
+            ctx.logger.exception("Unexpected pipeline failure")
+            return PipelineResult(exit_code=1, error=exc)
+
+        ctx.logger.info("Pipeline completed successfully")
+        return PipelineResult(exit_code=0)
+
+    def _build_run_flags(
+        self,
+        ctx: PipelineContext,
+        stage_names: list[str],
+    ) -> dict[str, bool]:
+        """
+        Build execution flags for each stage.
+        """
+        flags = {name: True for name in stage_names}
+
+        # --- skip-stage ---
+        for name in ctx.args.skip_stage:
+            if name not in flags:
+                raise PipelineError(f"Unknown stage to skip: {name}")
+            flags[name] = False
+
+        # --- from-stage ---
+        if ctx.args.from_stage:
+            if ctx.args.from_stage not in flags:
+                raise PipelineError(f"Unknown from-stage: {ctx.args.from_stage}")
+            start = False
+            for name in stage_names:
+                if name == ctx.args.from_stage:
+                    start = True
+                flags[name] = start
+
+        # --- until-stage ---
+        if ctx.args.until_stage:
+            if ctx.args.until_stage not in flags:
+                raise PipelineError(f"Unknown until-stage: {ctx.args.until_stage}")
+            for name in stage_names:
+                if name == ctx.args.until_stage:
+                    break
+                flags[name] = flags[name]
+            for name in stage_names[stage_names.index(ctx.args.until_stage) + 1 :]:
+                flags[name] = False
+
+        return flags
 
 
 def pipeline_main(args: argparse.Namespace, logger: logging.Logger) -> int:
@@ -1647,10 +1738,9 @@ def pipeline_main(args: argparse.Namespace, logger: logging.Logger) -> int:
     Returns:
         Exit code.
     """
+    logger.info("Start Application")
+
     ctx = PipelineContext(args=args, logger=logger)
-
-    ctx.logger.info("Start Application")
-
     runner = PipelineRunner(
         stages=[
             PrepareStage(),
@@ -1660,39 +1750,14 @@ def pipeline_main(args: argparse.Namespace, logger: logging.Logger) -> int:
         ]
     )
 
-    try:
-        runner.run(ctx)
+    result = runner.run(ctx)
 
-    except PipelineEmptyResult as exc:
-        ctx.logger.warning(
-            "Pipeline finished with empty result: %s (stage=%s)",
-            exc,
-            exc.stage,
-        )
-        ctx.error = exc
-        return 0
+    if result.aborted:
+        logger.info("Application terminated by pipeline abort")
 
-    except PipelineAbort as exc:
-        ctx.logger.error(
-            "Pipeline aborted: %s (stage=%s)",
-            exc,
-            exc.stage,
-        )
-        ctx.aborted = True
-        ctx.error = exc
-        return 1
+    logger.info("End Application (exit_code=%d)", result.exit_code)
 
-    except PipelineError as exc:
-        ctx.logger.error("Pipeline error: %s", exc)
-        ctx.error = exc
-        return 1
-
-    except Exception:
-        ctx.logger.exception("Unexpected pipeline failure")
-        return 1
-
-    ctx.logger.info("Pipeline completed successfully")
-    return 0
+    return result.exit_code
 
 
 # ===== CLI entry point =====
@@ -1707,6 +1772,31 @@ if __name__ == "__main__":
         "--num-threads", type=int, default=4, help="torch threads number"
     )
     parser.add_argument("--max-chars", type=int, default=28)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print pipeline stages without executing",
+    )
+
+    parser.add_argument(
+        "--skip-stage",
+        action="append",
+        default=[],
+        help="Skip specified stage(s) (e.g. --skip-stage asr)",
+    )
+
+    parser.add_argument(
+        "--from-stage",
+        type=str,
+        help="Start pipeline execution from this stage",
+    )
+
+    parser.add_argument(
+        "--until-stage",
+        type=str,
+        help="Stop pipeline execution after this stage",
+    )
+
     args = parser.parse_args()
 
     torch.set_num_threads(args.num_threads)
